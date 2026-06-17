@@ -3049,6 +3049,205 @@ if _payload_fetch_ts != _last_bh_fetch_ts:
     _save_bias_history(st.session_state.bias_history)   # persist for mid-session joiners
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ═════════════════════════════════════════════════════════════════════════════
+# GREEK RISK FRAMEWORK — Intraday Bias & Confidence Score           (v1.0)
+# Derived from live metrics already computed above:
+#   Net Delta · OI Momentum · GEX · Gamma Walls · PCR · Max Pain · IV Rank
+# Scoring: Gamma (0-3) + Delta (0-3) + Momentum (0-4) = 0-10
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _compute_grf(m_dict, spot_px):
+    """Greek Risk Framework scorer — all inputs from compute_metrics() dict."""
+    nd      = safe_num(m_dict.get("net_delta",           0))
+    mom     = safe_num(m_dict.get("momentum",            0))
+    gex     = safe_num(m_dict.get("gex",                 0))
+    d_res   = safe_num(m_dict.get("dist_to_resistance",  0))   # resistance - spot  (>0 = spot below wall)
+    d_sup   = safe_num(m_dict.get("dist_to_support",     0))   # spot - support      (>0 = spot above wall)
+    mp_val  = safe_num(m_dict.get("max_pain",       spot_px))
+    pcr     = safe_num(m_dict.get("pcr",                1.0))
+    iv_r    = safe_num(m_dict.get("iv_rank",             50))
+    gflip   = m_dict.get("gamma_flip")
+    sup_w   = safe_num(m_dict.get("support",             0))
+    res_w   = safe_num(m_dict.get("resistance",          0))
+    fac     = []
+
+    # BUG 3 FIX — adaptive noise floor: scale thresholds to actual OI size.
+    # Quiet days have low absolute net_delta; active days have high values.
+    # Using 0.1% / 0.05% of total wide-band OI as the meaningful-signal floor.
+    _oi_scale = max(1.0, safe_num(m_dict.get("call_oi_total", 0)) + safe_num(m_dict.get("put_oi_total", 0)))
+    nd_sig    = abs(nd)  > max(100, _oi_scale * 0.001)
+    mom_sig   = abs(mom) > max(50,  _oi_scale * 0.0005)
+
+    # 1. Gamma Score (0-3): range quality from GEX + wall distances ──────────
+    g = 0
+    # BUG 1 FIX — only award buffer points when spot is INSIDE the S/R band.
+    # When d_res ≤ 0 spot has broken above resistance; when d_sup ≤ 0 spot has
+    # broken below support. Using abs() on a negative distance made a breakout
+    # falsely look like a safe buffer. Instead: breakout = 0 gamma score.
+    inside_band = (d_res > 0) and (d_sup > 0)
+    if inside_band:
+        min_buf = (min(d_res, d_sup) / spot_px * 100) if spot_px > 0 else 0
+        if   min_buf > 1.0: g += 2; fac.append(f"Walls {min_buf:.1f}% from spot — safe sell range")
+        elif min_buf > 0.5: g += 1; fac.append(f"Moderate wall buffer ({min_buf:.1f}%)")
+        else:                        fac.append(f"Walls very close ({min_buf:.1f}%) — elevated gamma risk")
+        if gex > 0: g += 1
+    else:
+        broke_dir = "above resistance" if d_res <= 0 else "below support"
+        fac.append(f"⚠ Spot {broke_dir} — gamma range breached, avoid selling")
+    g = min(g, 3)
+
+    # 2. Delta Score (0-3): net delta direction + confirming anchors ──────────
+    d = 0
+    nd_bull = nd > 0
+    if nd_sig:
+        d += 1
+        fac.append(f"Net delta {'bullish' if nd_bull else 'bearish'} ({nd:+,.0f})")
+    if nd_sig and mp_val > 0 and spot_px > 0:
+        mp_bull = mp_val > spot_px
+        if nd_bull == mp_bull and abs(mp_val - spot_px) > 20:
+            d += 1
+            fac.append(f"Max pain ({int(mp_val)}) confirms {'upside' if mp_bull else 'downside'} pull")
+    if nd_sig and gflip is not None:
+        gf = safe_num(gflip)
+        if gf > 0 and (spot_px > gf) == nd_bull:
+            d += 1
+            fac.append(f"Spot {'above' if spot_px > gf else 'below'} gamma flip ({int(gf)}) — regime aligned")
+    d = min(d, 3)
+
+    # 3. Momentum Score (0-4): OI flow direction + PCR + IV rank ─────────────
+    ms       = 0
+    mom_bull = mom > 0
+    if not mom_sig:
+        ms = 1   # flat/negligible flow — neutral
+    elif nd_sig and mom_bull == nd_bull:
+        ms = 3
+        fac.append(f"OI momentum confirms {'bullish' if mom_bull else 'bearish'} flow ({mom:+,.0f})")
+    elif nd_sig and mom_bull != nd_bull:
+        ms = 0
+        fac.append(f"⚠ Momentum contradicts net delta — divergence, cut size")
+    else:
+        ms = 2
+    if nd_sig:
+        if nd_bull and pcr >= 1.2:
+            ms = min(ms + 1, 4); fac.append(f"PCR {pcr:.2f} confirms bullish support")
+        elif not nd_bull and pcr <= 0.8:
+            ms = min(ms + 1, 4); fac.append(f"PCR {pcr:.2f} confirms bearish pressure")
+    if   iv_r <= 35: ms = min(ms + 1, 4)   # calm IV = ideal sell environment
+    elif iv_r >= 70: ms = max(ms - 1, 0)   # high IV = elevated risk
+    ms = min(ms, 4)
+
+    total = g + d + ms
+
+    # BUG 2 FIX — exhaustive label logic so momentum-only signals surface correctly.
+    # Original had mom<=0 / mom>=0 in the mixed branches, swallowing the flat-momentum
+    # and momentum-only cases into a silent "NEUTRAL" that hid real directional flow.
+    if   nd > 0 and mom > 0:   bias_s = "BULLISH"
+    elif nd < 0 and mom < 0:   bias_s = "BEARISH"
+    elif nd > 0 and mom < 0:   bias_s = "MIXED — delta bull / momentum fading"
+    elif nd < 0 and mom > 0:   bias_s = "MIXED — delta bear / momentum recovering"
+    elif nd > 0:               bias_s = "BULLISH (flat momentum)"
+    elif nd < 0:               bias_s = "BEARISH (flat momentum)"
+    elif mom > 0:              bias_s = "NEUTRAL — flow tilting bullish"
+    elif mom < 0:              bias_s = "NEUTRAL — flow tilting bearish"
+    else:                      bias_s = "NEUTRAL"
+
+    # Conviction label + recommendation
+    if   total >= 8: conv, cc, sl, rtxt = "HIGH CONVICTION", "#059669", "Full size",  "All Greeks aligned. Deploy full planned size within the gamma range."
+    elif total >= 6: conv, cc, sl, rtxt = "GOOD SETUP",      "#10B981", "Standard",   "Most signals confirm. Trade standard size; monitor the weakest Greek."
+    elif total >= 4: conv, cc, sl, rtxt = "MODERATE",        "#D97706", "Half size",  "Mixed signals. Half size only, or wait 30–60 min for clarity."
+    elif total >= 2: conv, cc, sl, rtxt = "LOW",             "#F59E0B", "Avoid",      "Greeks not aligned. Watch only — do not deploy capital now."
+    else:            conv, cc, sl, rtxt = "NO TRADE",        "#DC2626", "Stay out",   "Conflicting signals. Protect capital and wait for a cleaner setup."
+
+    iv_env = "Low IV — ideal" if iv_r <= 35 else ("High IV — caution" if iv_r >= 70 else "Mid IV — ok")
+    return dict(
+        total=total, g=g, d=d, ms=ms,
+        bias_s=bias_s, conv=conv, cc=cc, sl=sl, rtxt=rtxt,
+        fac=fac[:4],
+        gamma_range=f"{int(sup_w)}–{int(res_w)}" if sup_w and res_w else "—",
+        iv_env=iv_env, iv_r=iv_r,
+    )
+
+_grf        = _compute_grf(m, spot)
+_grf_dc     = GREEN if _grf["bias_s"] == "BULLISH" else (RED if _grf["bias_s"] == "BEARISH" else AMBER)
+_grf_fac_html = "".join(
+    f'<div style="font-size:11px;color:#374151;padding:2px 0;line-height:1.4;">&#9656; {f}</div>'
+    for f in _grf["fac"]
+) or '<div style="font-size:11px;color:#9CA3AF;">Collecting signals…</div>'
+
+def _gbar(v, mx, clr):
+    pct = int(v / mx * 100)
+    return (f'<div style="background:#F3F4F6;border-radius:4px;height:7px;margin-top:4px;">'
+            f'<div style="width:{pct}%;background:{clr};height:7px;border-radius:4px;"></div></div>')
+
+st.markdown(
+    '<div class="section-header">&#128300; Greek Risk Framework &mdash; Intraday Bias &amp; Confidence Score</div>',
+    unsafe_allow_html=True)
+st.markdown(f"""
+<div style="background:#fff;border:1.5px solid {_grf['cc']};border-radius:10px;
+     padding:14px 18px 12px 22px;margin-bottom:14px;position:relative;">
+  <div style="position:absolute;left:0;top:0;bottom:0;width:5px;
+       background:{_grf['cc']};border-radius:10px 0 0 10px;"></div>
+
+  <!-- Row 1: bias badge + conviction + range/size -->
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+    <span style="background:{_grf_dc}22;color:{_grf_dc};border:1px solid {_grf_dc};
+          border-radius:6px;padding:3px 12px;font-size:13px;font-weight:800;">
+      {_grf['bias_s']}
+    </span>
+    <span style="background:{_grf['cc']}22;color:{_grf['cc']};border:1px solid {_grf['cc']};
+          border-radius:6px;padding:2px 10px;font-size:12px;font-weight:700;">
+      {_grf['conv']} &nbsp;·&nbsp; {_grf['total']}/10
+    </span>
+    <span style="font-size:11px;color:#6B7280;margin-left:auto;">
+      Gamma range: <strong>{_grf['gamma_range']}</strong>
+      &nbsp;·&nbsp; Position size: <strong style="color:{_grf['cc']};">{_grf['sl']}</strong>
+    </span>
+  </div>
+
+  <!-- Row 2: sub-score progress bars -->
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:10px;">
+    <div>
+      <div style="font-size:11px;font-weight:600;color:#6B7280;">
+        Gamma · Range quality &nbsp;<strong style="color:#1A1A2E;">{_grf['g']}/3</strong>
+      </div>
+      {_gbar(_grf['g'], 3, '#5DCAA5')}
+    </div>
+    <div>
+      <div style="font-size:11px;font-weight:600;color:#6B7280;">
+        Delta · Equilibrium &nbsp;<strong style="color:#1A1A2E;">{_grf['d']}/3</strong>
+      </div>
+      {_gbar(_grf['d'], 3, '#378ADD')}
+    </div>
+    <div>
+      <div style="font-size:11px;font-weight:600;color:#6B7280;">
+        Momentum · Flow &nbsp;<strong style="color:#1A1A2E;">{_grf['ms']}/4</strong>
+      </div>
+      {_gbar(_grf['ms'], 4, '#7F77DD')}
+    </div>
+  </div>
+
+  <!-- Row 3: key signals + recommendation -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;
+       padding-top:10px;border-top:1px solid #F3F4F6;">
+    <div>
+      <div style="font-size:11px;font-weight:700;color:#374151;margin-bottom:4px;">Key signals</div>
+      {_grf_fac_html}
+    </div>
+    <div style="background:{_grf['cc']}22;border-radius:8px;padding:10px 12px;">
+      <div style="font-size:11px;font-weight:700;color:{_grf['cc']};margin-bottom:4px;">
+        Recommendation
+      </div>
+      <div style="font-size:12px;color:#374151;line-height:1.55;">{_grf['rtxt']}</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:6px;">
+        {_grf['iv_env']} (IV rank {_grf['iv_r']:.0f}) &nbsp;·&nbsp;
+        Sources: net delta · OI momentum · GEX · PCR · max pain
+      </div>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+# ══ END Greek Risk Framework ══════════════════════════════════════════════════
+
 # ── SECTION 3 & 4 MARKET BIAS vs NIFTY SPOT ─────────────────────────────────
 _bh_data = st.session_state.get("bias_history", [])
 
