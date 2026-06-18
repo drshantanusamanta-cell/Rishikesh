@@ -2004,13 +2004,19 @@ def compute_basis_signals(sf, traded_future):
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_nifty_intraday_candles():
     """
-    Fetch today's 1-min OHLCV for NIFTY 50 index from Dhan /v2/charts/intraday.
+    Fetch today's 1-min OHLCV for the near-month NIFTY Futures contract from
+    Dhan /v2/charts/intraday.  Uses the actual futures security ID resolved via
+    _resolve_futures_id() so VWAP is computed on real traded volume, not the
+    synthetic index tick count.
     Returns list of dicts {ts, open, high, low, close, volume} or [] on failure.
-    securityId=13 (NIFTY Index), exchangeSegment=IDX_I, instrument=INDEX.
     """
     if not USE_DHAN:
         return []
     import requests
+    # Resolve near-month NIFTY futures security ID (reuses existing helper)
+    _fut_sec_id, _fut_expiry = _resolve_futures_id()
+    if not _fut_sec_id:
+        return []
     today_str = date.today().strftime("%Y-%m-%d")
     headers = {
         "access-token": DHAN_ACCESS_TOKEN,
@@ -2022,9 +2028,9 @@ def fetch_nifty_intraday_candles():
             "https://api.dhan.co/v2/charts/intraday",
             headers=headers,
             json={
-                "securityId":      "13",
-                "exchangeSegment": "IDX_I",
-                "instrument":      "INDEX",
+                "securityId":      str(_fut_sec_id),
+                "exchangeSegment": "NSE_FNO",
+                "instrument":      "FUTIDX",
                 "interval":        "1",
                 "oi":              False,
                 "fromDate":        f"{today_str} 09:15:00",
