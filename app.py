@@ -2183,7 +2183,23 @@ def compute_term_structure_signal(front_atm_iv: float, back_atm_iv):
     Normal contango  (front < back): market calm, range bias confirmed.
     Flat term structure (|slope| < 1): transitional.
     Backwardation (front > back): near-term event risk, directional move likely.
+
+    NOTE: On NIFTY weekly expiry day (Thursday) the front expiry IV collapses
+    to near-zero, making the slope unreliable. Signal is suppressed on Thursdays.
     """
+    # Expiry-day guard: suppress on Thursday (NIFTY weekly expiry)
+    from datetime import date as _date
+    if _date.today().weekday() == 3:  # 3 = Thursday
+        return {
+            "available":   False,
+            "front_iv":    round(front_atm_iv, 2) if front_atm_iv else 0.0,
+            "back_iv":     None,
+            "slope":       None,
+            "regime":      "EXPIRY_DAY",
+            "ts_label":    "Expiry day — term structure suppressed (front IV unreliable)",
+            "ts_color":    "#6B7280",
+            "ts_score":    0.0,
+        }
     if not back_atm_iv or back_atm_iv <= 0 or front_atm_iv <= 0:
         return {
             "available":   False,
@@ -2290,10 +2306,10 @@ def fetch_india_vix_ltp():
         resp  = requests.post(
             "https://api.dhan.co/v2/marketfeed/ltp",
             headers=headers,
-            json={"NSE_EQ": [int(vix_id)]},
+            json={"NSE_INDEX": [int(vix_id)]},
             timeout=8,
         )
-        seg = (resp.json().get("data") or {}).get("NSE_EQ") or {}
+        seg = (resp.json().get("data") or {}).get("NSE_INDEX") or {}
         for _, info in seg.items():
             ltp = float(info.get("last_price") or info.get("ltp") or 0)
             if ltp > 0:
@@ -2371,11 +2387,15 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
     Combine the three new signals with the existing S3/4 score into one
     Enhanced Bias Score (-100 to +100) and confidence rating.
 
-    Weights (total 100 pts):
+    Base weights (total 100 pts):
       S3/4 options flow  : 70 pts  (existing engine, unchanged)
       VWAP + OR          : 10 pts  (new — price confirmation)
       Term Structure      : 10 pts  (new — IV slope confirmation)
       India VIX           : 10 pts  (new — volatility regime)
+
+    DYNAMIC REDISTRIBUTION: when a new-signal module is unavailable its 10 pts
+    are redistributed to S3/4 so the enhanced score never deflates below the
+    raw S3/4 score when the new layers have no data.
 
     The final score is the weighted sum scaled to [-100, +100].
     Confidence is boosted when all four signals agree.
@@ -2384,12 +2404,22 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
     ts_s    = safe_num(ts_signal["ts_score"])   if ts_signal else 0.0
     vix_s   = safe_num(vix_signal["vix_score"]) if vix_signal else 0.0
 
-    # S3/4 score is already on -100/+100 scale; scale down to 70-pt contribution
-    s34_contrib  = (s34_score / 100.0) * 70.0
-    # New signals max out at ±10 each
-    price_contrib = (price_s / 10.0) * 10.0
-    ts_contrib    = (ts_s    / 8.0)  * 10.0   # ts_score max is 8
-    vix_contrib   = (vix_s   / 8.0)  * 10.0   # vix_score max is 8
+    # Determine which new modules are live
+    price_live = vwap_or  is not None and vwap_or.get("n_candles", 0) > 5
+    ts_live    = ts_signal  is not None and ts_signal.get("available", False)
+    vix_live   = vix_signal is not None and vix_signal.get("available", False)
+
+    # Dynamic weight allocation: unavailable modules cede their 10 pts to S3/4
+    w_price = 10 if price_live else 0
+    w_ts    = 10 if ts_live    else 0
+    w_vix   = 10 if vix_live   else 0
+    w_s34   = 100 - w_price - w_ts - w_vix   # absorbs freed weight; min 70, max 100
+
+    # Normalise each signal to its weight bucket
+    s34_contrib   = (s34_score / 100.0) * w_s34
+    price_contrib = (price_s   / 10.0)  * w_price
+    ts_contrib    = (ts_s      / 8.0)   * w_ts   # ts_score max ±8
+    vix_contrib   = (vix_s     / 8.0)   * w_vix  # vix_score max ±8
 
     raw_score = s34_contrib + price_contrib + ts_contrib + vix_contrib
     enhanced_score = round(max(-100.0, min(100.0, raw_score)), 1)
@@ -2414,12 +2444,8 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
     elif enhanced_score <= -10: direction = "MILDLY BEARISH"; color = "#F59E0B"
     else:                       direction = "NEUTRAL";    color = "#6B7280"
 
-    # Determine how many new signals are live
-    new_signals_available = sum([
-        vwap_or  is not None and vwap_or.get("n_candles", 0) > 5,
-        ts_signal is not None and ts_signal.get("available", False),
-        vix_signal is not None and vix_signal.get("available", False),
-    ])
+    # Determine how many new signals are live (reuse booleans from weight calc)
+    new_signals_available = sum([price_live, ts_live, vix_live])
 
     return {
         "enhanced_score":          enhanced_score,
