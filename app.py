@@ -1992,6 +1992,451 @@ def compute_basis_signals(sf, traded_future):
             "T_days":sf["T_days"],"atm":sf["atm"],"call_ltp":sf["call_ltp"],"put_ltp":sf["put_ltp"]}
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ENHANCED PRICE CONFIRMATION LAYER  (v7 addition — surgical)
+#   Module A: VWAP + Opening Range  (Dhan /v2/charts/intraday)
+#   Module B: Term Structure         (second expiry from /v2/optionchain)
+#   Module C: India VIX              (Dhan instrument master + LTP feed)
+# All three are read-only additions. No existing variables modified.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Module A: VWAP + Opening Range ───────────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_nifty_intraday_candles():
+    """
+    Fetch today's 1-min OHLCV for NIFTY 50 index from Dhan /v2/charts/intraday.
+    Returns list of dicts {ts, open, high, low, close, volume} or [] on failure.
+    securityId=13 (NIFTY Index), exchangeSegment=IDX_I, instrument=INDEX.
+    """
+    if not USE_DHAN:
+        return []
+    import requests
+    today_str = date.today().strftime("%Y-%m-%d")
+    headers = {
+        "access-token": DHAN_ACCESS_TOKEN,
+        "client-id":    str(DHAN_CLIENT_ID),
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(
+            "https://api.dhan.co/v2/charts/intraday",
+            headers=headers,
+            json={
+                "securityId":      "13",
+                "exchangeSegment": "IDX_I",
+                "instrument":      "INDEX",
+                "interval":        "1",
+                "oi":              False,
+                "fromDate":        f"{today_str} 09:15:00",
+                "toDate":          f"{today_str} 15:30:00",
+            },
+            timeout=15,
+        )
+        data = resp.json()
+        ts_arr  = data.get("timestamp", [])
+        op_arr  = data.get("open",      [])
+        hi_arr  = data.get("high",      [])
+        lo_arr  = data.get("low",       [])
+        cl_arr  = data.get("close",     [])
+        vo_arr  = data.get("volume",    [])
+        if not ts_arr:
+            return []
+        candles = []
+        for i, ts in enumerate(ts_arr):
+            candles.append({
+                "ts":     int(ts),
+                "open":   float(op_arr[i]) if i < len(op_arr) else 0.0,
+                "high":   float(hi_arr[i]) if i < len(hi_arr) else 0.0,
+                "low":    float(lo_arr[i]) if i < len(lo_arr) else 0.0,
+                "close":  float(cl_arr[i]) if i < len(cl_arr) else 0.0,
+                "volume": float(vo_arr[i]) if i < len(vo_arr) else 0.0,
+            })
+        return candles
+    except Exception:
+        return []
+
+
+def compute_vwap_opening_range(candles):
+    """
+    From today's 1-min candles compute:
+      - Opening Range high/low  (first 15 candles = 9:15–9:30)
+      - Running VWAP (cumulative typical-price × volume / cumulative volume)
+      - Current candle vs VWAP position
+    Returns dict or None if data insufficient.
+    """
+    if not candles or len(candles) < 2:
+        return None
+    # Opening Range: first 15 1-min candles (9:15–9:29)
+    or_candles = candles[:15]
+    or_high  = max(c["high"]  for c in or_candles)
+    or_low   = min(c["low"]   for c in or_candles)
+    or_mid   = (or_high + or_low) / 2.0
+    # VWAP: cumulative (typical_price × volume) / cumulative_volume
+    cum_tpv = 0.0
+    cum_vol = 0.0
+    for c in candles:
+        tp = (c["high"] + c["low"] + c["close"]) / 3.0
+        cum_tpv += tp * c["volume"]
+        cum_vol += c["volume"]
+    vwap = cum_tpv / cum_vol if cum_vol > 0 else 0.0
+    last_close = candles[-1]["close"]
+    # Signal derivation
+    above_vwap = last_close > vwap if vwap > 0 else None
+    or_position = (
+        "ABOVE_OR"  if last_close > or_high else
+        "BELOW_OR"  if last_close < or_low  else
+        "INSIDE_OR"
+    )
+    # Score contribution: +10 (above both), -10 (below both), else proportional
+    if vwap > 0 and above_vwap and or_position == "ABOVE_OR":
+        price_score = 10.0
+        price_label = "Bullish — price above VWAP & Opening Range"
+        price_color = "#059669"
+    elif vwap > 0 and (not above_vwap) and or_position == "BELOW_OR":
+        price_score = -10.0
+        price_label = "Bearish — price below VWAP & Opening Range"
+        price_color = "#DC2626"
+    elif vwap > 0 and above_vwap:
+        price_score = 5.0
+        price_label = "Mildly bullish — above VWAP, inside Opening Range"
+        price_color = "#10B981"
+    elif vwap > 0 and not above_vwap:
+        price_score = -5.0
+        price_label = "Mildly bearish — below VWAP, inside/above Opening Range"
+        price_color = "#F59E0B"
+    else:
+        price_score = 0.0
+        price_label = "VWAP unavailable (pre-session or no volume)"
+        price_color = "#6B7280"
+    return {
+        "vwap":        round(vwap, 2),
+        "or_high":     round(or_high, 2),
+        "or_low":      round(or_low, 2),
+        "or_mid":      round(or_mid, 2),
+        "last_close":  round(last_close, 2),
+        "above_vwap":  above_vwap,
+        "or_position": or_position,
+        "price_score": price_score,
+        "price_label": price_label,
+        "price_color": price_color,
+        "n_candles":   len(candles),
+    }
+
+
+# ── Module B: Term Structure (front vs back expiry ATM IV) ───────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_back_expiry_atm_iv(back_expiry: str):
+    """
+    Fetch the back-month option chain and return ATM IV only.
+    Runs concurrently with the main front-expiry fetch; same Dhan endpoint.
+    Rate limit note: 1 unique request per 3s — this is a different expiry
+    so qualifies as a unique request per Dhan docs.
+    """
+    if not USE_DHAN or not back_expiry:
+        return None
+    import requests
+    headers = {
+        "access-token": DHAN_ACCESS_TOKEN,
+        "client-id":    str(DHAN_CLIENT_ID),
+        "Content-Type": "application/json",
+    }
+    sec = DHAN_SECURITY["NIFTY"]
+    try:
+        resp = requests.post(
+            "https://api.dhan.co/v2/optionchain",
+            headers=headers,
+            json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
+                  "Expiry": back_expiry},
+            timeout=15,
+        )
+        data = resp.json().get("data", {}) or {}
+        spot = float(data.get("last_price") or data.get("ltp") or 0)
+        oc   = data.get("oc", {}) or {}
+        if spot <= 0 or not oc:
+            return None
+        # Find ATM strike
+        strikes = [safe_num(k) for k in oc.keys() if safe_num(k) > 0]
+        if not strikes:
+            return None
+        atm_k = min(strikes, key=lambda x: abs(x - spot))
+        chain = oc.get(str(float(atm_k)), oc.get(f"{atm_k:.6f}", {})) or {}
+        ce_iv = safe_num((chain.get("ce", {}) or {}).get("implied_volatility", 0))
+        pe_iv = safe_num((chain.get("pe", {}) or {}).get("implied_volatility", 0))
+        atm_iv_back = 0.0
+        if ce_iv > 0.5 and pe_iv > 0.5:
+            atm_iv_back = (ce_iv + pe_iv) / 2.0
+        elif ce_iv > 0.5:
+            atm_iv_back = ce_iv
+        elif pe_iv > 0.5:
+            atm_iv_back = pe_iv
+        return round(atm_iv_back, 2) if atm_iv_back > 0 else None
+    except Exception:
+        return None
+
+
+def compute_term_structure_signal(front_atm_iv: float, back_atm_iv):
+    """
+    Compute term structure slope and derive a bias signal.
+    front_atm_iv: ATM IV of nearest expiry (already in main metrics)
+    back_atm_iv:  ATM IV of second expiry from fetch_back_expiry_atm_iv()
+
+    Normal contango  (front < back): market calm, range bias confirmed.
+    Flat term structure (|slope| < 1): transitional.
+    Backwardation (front > back): near-term event risk, directional move likely.
+    """
+    if not back_atm_iv or back_atm_iv <= 0 or front_atm_iv <= 0:
+        return {
+            "available":   False,
+            "front_iv":    round(front_atm_iv, 2),
+            "back_iv":     None,
+            "slope":       None,
+            "regime":      "UNAVAILABLE",
+            "ts_label":    "Term structure data unavailable",
+            "ts_color":    "#6B7280",
+            "ts_score":    0.0,
+        }
+    slope = front_atm_iv - back_atm_iv   # positive = backwardation
+    if slope > 2.0:
+        regime    = "BACKWARDATION"
+        ts_label  = f"Backwardation: front IV {front_atm_iv:.1f}% > back {back_atm_iv:.1f}% (+{slope:.1f}pts) — near-term event risk"
+        ts_color  = "#DC2626"
+        ts_score  = -8.0   # near-term fear → reduce range/condor confidence
+    elif slope > 0.5:
+        regime    = "MILD_BACK"
+        ts_label  = f"Mild backwardation: front {front_atm_iv:.1f}% > back {back_atm_iv:.1f}% (+{slope:.1f}pts) — elevated near-term demand"
+        ts_color  = "#F59E0B"
+        ts_score  = -4.0
+    elif slope < -2.0:
+        regime    = "STEEP_CONTANGO"
+        ts_label  = f"Steep contango: front {front_atm_iv:.1f}% < back {back_atm_iv:.1f}% ({slope:.1f}pts) — market calm, range trades favoured"
+        ts_color  = "#059669"
+        ts_score  = +5.0
+    elif slope < -0.5:
+        regime    = "CONTANGO"
+        ts_label  = f"Contango: front {front_atm_iv:.1f}% < back {back_atm_iv:.1f}% ({slope:.1f}pts) — normal structure"
+        ts_color  = "#10B981"
+        ts_score  = +3.0
+    else:
+        regime    = "FLAT"
+        ts_label  = f"Flat term structure: front {front_atm_iv:.1f}% ≈ back {back_atm_iv:.1f}% ({slope:+.1f}pts) — transitional"
+        ts_color  = "#6B7280"
+        ts_score  = 0.0
+    return {
+        "available":  True,
+        "front_iv":   round(front_atm_iv, 2),
+        "back_iv":    round(back_atm_iv, 2),
+        "slope":      round(slope, 2),
+        "regime":     regime,
+        "ts_label":   ts_label,
+        "ts_color":   ts_color,
+        "ts_score":   ts_score,
+    }
+
+
+# ── Module C: India VIX ───────────────────────────────────────────────────────
+_vix_id_cache = {}
+
+def _resolve_india_vix_id():
+    """Look up India VIX security ID from the Dhan instruments master CSV."""
+    if "VIX" in _vix_id_cache:
+        return _vix_id_cache["VIX"]
+    master = _load_dhan_instrument_master()
+    if master is None:
+        return None
+    try:
+        cols = set(master.columns)
+        tsym_col  = next((c for c in ["SEM_TRADING_SYMBOL", "SM_SYMBOL_NAME"] if c in cols), None)
+        secid_col = next((c for c in ["SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID"] if c in cols), None)
+        seg_col   = next((c for c in ["SEM_EXM_EXCH_ID"] if c in cols), None)
+        if not tsym_col or not secid_col:
+            return None
+        df = master.copy()
+        if seg_col:
+            df = df[df[seg_col].astype(str).str.strip().str.upper() == "NSE"]
+        mask = df[tsym_col].astype(str).str.strip().str.upper().str.contains("VIX", na=False)
+        vix_rows = df[mask]
+        if vix_rows.empty:
+            return None
+        sec_id = str(int(float(vix_rows.iloc[0][secid_col])))
+        _vix_id_cache["VIX"] = sec_id
+        return sec_id
+    except Exception:
+        return None
+
+
+_vix_ltp_cache_v7 = {"ltp": 0.0, "ts": 0.0}
+_VIX_CACHE_SEC = 58
+
+def fetch_india_vix_ltp():
+    """
+    Fetch India VIX LTP via Dhan /v2/marketfeed/ltp using the VIX security ID.
+    Falls back to 0.0 if unavailable (graceful — VIX not a required signal).
+    """
+    if not USE_DHAN:
+        return 0.0
+    import requests
+    now = time.time()
+    if now - _vix_ltp_cache_v7["ts"] < _VIX_CACHE_SEC and _vix_ltp_cache_v7["ltp"] > 0:
+        return _vix_ltp_cache_v7["ltp"]
+    vix_id = _resolve_india_vix_id()
+    if not vix_id:
+        return 0.0
+    headers = {
+        "access-token": DHAN_ACCESS_TOKEN,
+        "client-id":    str(DHAN_CLIENT_ID),
+        "Content-Type": "application/json",
+    }
+    try:
+        resp  = requests.post(
+            "https://api.dhan.co/v2/marketfeed/ltp",
+            headers=headers,
+            json={"NSE_EQ": [int(vix_id)]},
+            timeout=8,
+        )
+        seg = (resp.json().get("data") or {}).get("NSE_EQ") or {}
+        for _, info in seg.items():
+            ltp = float(info.get("last_price") or info.get("ltp") or 0)
+            if ltp > 0:
+                _vix_ltp_cache_v7["ltp"] = ltp
+                _vix_ltp_cache_v7["ts"]  = now
+                return ltp
+    except Exception:
+        pass
+    return _vix_ltp_cache_v7.get("ltp", 0.0)
+
+
+def classify_vix_signal(vix_val: float, vix_history: list):
+    """
+    Classify India VIX level and intraday change into a bias signal.
+    vix_history: list of float (recent VIX readings in session)
+
+    VIX < 13   : Very low — complacency / range-bound — bearish contrarian risk
+    13–15      : Low-normal — calm trending environment
+    15–18      : Normal — balanced
+    18–22      : Elevated — caution, directional but volatile
+    > 22       : High fear — mean-reversion / protective bias
+    """
+    if vix_val <= 0:
+        return {
+            "available": False,
+            "vix":       0.0,
+            "regime":    "UNAVAILABLE",
+            "vix_label": "India VIX unavailable",
+            "vix_color": "#6B7280",
+            "vix_score": 0.0,
+            "vix_change":None,
+        }
+    # Intraday change
+    vix_change = None
+    if len(vix_history) >= 2:
+        vix_change = round(vix_val - vix_history[-2], 2)
+    # Classify level
+    if vix_val > 22:
+        regime = "HIGH_FEAR"; vix_color = "#DC2626"; vix_score = -8.0
+        vix_label = f"VIX {vix_val:.1f} — HIGH FEAR: elevated put demand, mean-reversion risk"
+    elif vix_val > 18:
+        regime = "ELEVATED"; vix_color = "#F59E0B"; vix_score = -4.0
+        vix_label = f"VIX {vix_val:.1f} — Elevated: volatile conditions, reduce size"
+    elif vix_val > 15:
+        regime = "NORMAL"; vix_color = "#6B7280"; vix_score = 0.0
+        vix_label = f"VIX {vix_val:.1f} — Normal range: no regime distortion"
+    elif vix_val > 13:
+        regime = "LOW_CALM"; vix_color = "#10B981"; vix_score = +3.0
+        vix_label = f"VIX {vix_val:.1f} — Low/calm: range trades and premium selling favoured"
+    else:
+        regime = "COMPLACENCY"; vix_color = "#F59E0B"; vix_score = -3.0
+        vix_label = f"VIX {vix_val:.1f} — Very low: complacency alert, contrarian reversal risk"
+    # Spike modifier
+    if vix_change is not None and vix_change >= 1.5:
+        vix_label += f"  ⚡ Spike +{vix_change:.2f} pts this tick"
+        vix_score  = min(vix_score - 3.0, -3.0)
+        vix_color  = "#DC2626"
+    elif vix_change is not None and vix_change <= -1.5:
+        vix_label += f"  ↓ Deflating {vix_change:.2f} pts"
+        vix_score  = max(vix_score + 2.0, 2.0)
+    return {
+        "available":  True,
+        "vix":        round(vix_val, 2),
+        "regime":     regime,
+        "vix_label":  vix_label,
+        "vix_color":  vix_color,
+        "vix_score":  vix_score,
+        "vix_change": vix_change,
+    }
+
+
+# ── Enhanced combined price bias aggregator ───────────────────────────────────
+def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float, spot: float):
+    """
+    Combine the three new signals with the existing S3/4 score into one
+    Enhanced Bias Score (-100 to +100) and confidence rating.
+
+    Weights (total 100 pts):
+      S3/4 options flow  : 70 pts  (existing engine, unchanged)
+      VWAP + OR          : 10 pts  (new — price confirmation)
+      Term Structure      : 10 pts  (new — IV slope confirmation)
+      India VIX           : 10 pts  (new — volatility regime)
+
+    The final score is the weighted sum scaled to [-100, +100].
+    Confidence is boosted when all four signals agree.
+    """
+    price_s = safe_num(vwap_or["price_score"])  if vwap_or  else 0.0
+    ts_s    = safe_num(ts_signal["ts_score"])   if ts_signal else 0.0
+    vix_s   = safe_num(vix_signal["vix_score"]) if vix_signal else 0.0
+
+    # S3/4 score is already on -100/+100 scale; scale down to 70-pt contribution
+    s34_contrib  = (s34_score / 100.0) * 70.0
+    # New signals max out at ±10 each
+    price_contrib = (price_s / 10.0) * 10.0
+    ts_contrib    = (ts_s    / 8.0)  * 10.0   # ts_score max is 8
+    vix_contrib   = (vix_s   / 8.0)  * 10.0   # vix_score max is 8
+
+    raw_score = s34_contrib + price_contrib + ts_contrib + vix_contrib
+    enhanced_score = round(max(-100.0, min(100.0, raw_score)), 1)
+
+    # Signal agreement for confidence
+    signs = []
+    if s34_score != 0:   signs.append(1 if s34_score > 0 else -1)
+    if price_s   != 0:   signs.append(1 if price_s   > 0 else -1)
+    if ts_s      != 0:   signs.append(1 if ts_s      > 0 else -1)
+    if vix_s     != 0:   signs.append(1 if vix_s     > 0 else -1)
+    agree_count = sum(1 for s in signs if s == (1 if enhanced_score >= 0 else -1))
+    n_signals   = max(len(signs), 1)
+    agreement_pct = agree_count / n_signals
+
+    base_confidence = min(abs(enhanced_score), 100)
+    conf_bonus      = agreement_pct * 20.0   # up to +20 when all agree
+    enhanced_conf   = round(min(100.0, base_confidence * 0.6 + conf_bonus), 1)
+
+    if   enhanced_score >= 30:  direction = "BULLISH";    color = "#059669"
+    elif enhanced_score >= 10:  direction = "MILDLY BULLISH"; color = "#10B981"
+    elif enhanced_score <= -30: direction = "BEARISH";    color = "#DC2626"
+    elif enhanced_score <= -10: direction = "MILDLY BEARISH"; color = "#F59E0B"
+    else:                       direction = "NEUTRAL";    color = "#6B7280"
+
+    # Determine how many new signals are live
+    new_signals_available = sum([
+        vwap_or  is not None and vwap_or.get("n_candles", 0) > 5,
+        ts_signal is not None and ts_signal.get("available", False),
+        vix_signal is not None and vix_signal.get("available", False),
+    ])
+
+    return {
+        "enhanced_score":          enhanced_score,
+        "direction":               direction,
+        "color":                   color,
+        "enhanced_conf":           enhanced_conf,
+        "agreement_pct":           round(agreement_pct * 100, 0),
+        "s34_score":               s34_score,
+        "price_score":             price_s,
+        "ts_score":                ts_s,
+        "vix_score":               vix_s,
+        "new_signals_available":   new_signals_available,
+    }
+
+# ══ END ENHANCED PRICE CONFIRMATION LAYER ════════════════════════════════════
+
+
 # ─── History helpers ──────────────────────────────────────────────────────────
 def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_excess=None, basis_gap=None, traded_basis=None):
     return {
@@ -3021,6 +3466,36 @@ _early_smile      = classify_iv_smile_scenario(
 _combined_decision = generate_combined_decision(_s34_bias, _early_smile, m)
 # ── end early IV smile call ───────────────────────────────────────────────
 
+# ── Enhanced Price Confirmation Layer  (v7 — surgical addition) ──────────────
+# Module A: VWAP + Opening Range
+_intraday_candles  = fetch_nifty_intraday_candles()
+_vwap_or_data      = compute_vwap_opening_range(_intraday_candles)
+
+# Module B: Term Structure (front vs back expiry ATM IV)
+_back_expiry       = _expiry_list[1] if len(_expiry_list) > 1 else None
+_back_atm_iv       = fetch_back_expiry_atm_iv(_back_expiry) if _back_expiry else None
+_ts_data           = compute_term_structure_signal(
+    safe_num(m.get("atm_iv", 0)), _back_atm_iv
+)
+
+# Module C: India VIX
+_vix_raw           = fetch_india_vix_ltp()
+# Maintain a lightweight intraday VIX history in session_state for spike detection
+if "vix_history" not in st.session_state:
+    st.session_state.vix_history = []
+if _vix_raw > 0:
+    if (not st.session_state.vix_history or
+            st.session_state.vix_history[-1] != _vix_raw):
+        st.session_state.vix_history.append(_vix_raw)
+        st.session_state.vix_history = st.session_state.vix_history[-30:]
+_vix_data          = classify_vix_signal(_vix_raw, st.session_state.vix_history)
+
+# Aggregate into Enhanced Price Bias
+_enhanced_bias     = compute_enhanced_price_bias(
+    _vwap_or_data, _ts_data, _vix_data, _s34_score, spot
+)
+# ── end Enhanced Price Confirmation Layer ─────────────────────────────────────
+
 _now_bias = time.time()
 # Dedup on server fetch timestamp, not wall-clock time.
 # Reading from disk catches entries written by OTHER visitor sessions, preventing
@@ -3178,6 +3653,186 @@ def _gbar(v, mx, clr):
     pct = int(v / mx * 100)
     return (f'<div style="background:#F3F4F6;border-radius:4px;height:7px;margin-top:4px;">'
             f'<div style="width:{pct}%;background:{clr};height:7px;border-radius:4px;"></div></div>')
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ⚡ ENHANCED BIAS PANEL — TOP OF DASHBOARD  (v7 addition)
+# Combines existing S3/4 options flow with three new live layers:
+#   VWAP + Opening Range · Term Structure (front/back IV) · India VIX
+# Renders BEFORE all other sections. No existing code touched below this block.
+# ═════════════════════════════════════════════════════════════════════════════
+def _render_enhanced_bias_panel(eb, vwap_or, ts, vix, cd, spot_px, metrics):
+    """
+    Top-of-dashboard panel surfacing the four-layer Enhanced Price Bias.
+    All arguments are pre-computed above; this function is purely presentational.
+    """
+    esc   = eb["enhanced_score"]
+    ecol  = eb["color"]
+    edir  = eb["direction"]
+    econf = eb["enhanced_conf"]
+    eagr  = eb["agreement_pct"]
+    nsig  = eb["new_signals_available"]
+
+    # ── Helper: small info chip ───────────────────────────────────────────────
+    def _chip(label, value, color, bg=None):
+        bg = bg or f"{color}18"
+        return (f'<span style="background:{bg};color:{color};border:1px solid {color};'
+                f'border-radius:5px;padding:2px 9px;font-size:11px;font-weight:700;'
+                f'white-space:nowrap;">{label}: {value}</span>')
+
+    # ── Row 1: main badge + score bar ─────────────────────────────────────────
+    bar_pct = int(abs(esc))
+    bar_color = ecol
+    score_bar = (
+        f'<div style="background:#F3F4F6;border-radius:4px;height:8px;margin:6px 0 4px 0;">'
+        f'<div style="width:{bar_pct}%;background:{bar_color};height:8px;border-radius:4px;'
+        f'transition:width 0.4s;"></div></div>'
+    )
+
+    # ── Row 2: four signal chips ──────────────────────────────────────────────
+    s34_col  = "#059669" if eb["s34_score"] > 10 else ("#DC2626" if eb["s34_score"] < -10 else "#6B7280")
+    chips_html = " ".join([
+        _chip("S3/4", f"{eb['s34_score']:+.0f}", s34_col),
+        _chip("VWAP/OR",
+              f"{eb['price_score']:+.0f}" if vwap_or else "—",
+              vwap_or["price_color"] if vwap_or else "#6B7280"),
+        _chip("Term Struct",
+              ts["regime"].replace("_"," ") if ts and ts["available"] else "—",
+              ts["ts_color"] if ts and ts["available"] else "#6B7280"),
+        _chip("VIX",
+              f"{vix['vix']:.1f}" if vix and vix["available"] else "—",
+              vix["vix_color"] if vix and vix["available"] else "#6B7280"),
+    ])
+
+    # ── Row 3: detail lines for each new signal ───────────────────────────────
+    detail_lines = []
+    if vwap_or and vwap_or.get("n_candles", 0) > 5:
+        detail_lines.append(
+            f'<div style="font-size:11px;color:#374151;padding:2px 0;">&#9642; '
+            f'<strong>VWAP</strong> {vwap_or["vwap"]:,.1f} &nbsp;·&nbsp; '
+            f'OR {vwap_or["or_low"]:,.0f}–{vwap_or["or_high"]:,.0f} &nbsp;·&nbsp; '
+            f'<span style="color:{vwap_or["price_color"]};font-weight:700;">{vwap_or["price_label"]}</span>'
+            f'</div>'
+        )
+    elif not USE_DHAN:
+        detail_lines.append(
+            '<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+            '&#9642; VWAP/OR: unavailable in demo mode</div>'
+        )
+    else:
+        detail_lines.append(
+            '<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+            '&#9642; VWAP/OR: building (need 5+ candles — session starting)</div>'
+        )
+
+    if ts and ts["available"]:
+        detail_lines.append(
+            f'<div style="font-size:11px;color:#374151;padding:2px 0;">&#9642; '
+            f'<strong>Term Structure</strong> — <span style="color:{ts["ts_color"]};font-weight:700;">'
+            f'{ts["ts_label"]}</span></div>'
+        )
+    else:
+        detail_lines.append(
+            '<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+            '&#9642; Term Structure: single expiry only (back-month data unavailable)</div>'
+        )
+
+    if vix and vix["available"]:
+        chg_str = (f' &nbsp;·&nbsp; Δ {vix["vix_change"]:+.2f} pts this tick'
+                   if vix["vix_change"] is not None else "")
+        detail_lines.append(
+            f'<div style="font-size:11px;color:#374151;padding:2px 0;">&#9642; '
+            f'<strong>India VIX</strong> — <span style="color:{vix["vix_color"]};font-weight:700;">'
+            f'{vix["vix_label"]}</span>{chg_str}</div>'
+        )
+    else:
+        detail_lines.append(
+            '<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+            '&#9642; India VIX: not available via Dhan API on this account</div>'
+        )
+
+    details_html = "\n".join(detail_lines)
+
+    # ── Agreement indicator ───────────────────────────────────────────────────
+    agr_color = "#059669" if eagr >= 75 else ("#F59E0B" if eagr >= 50 else "#DC2626")
+    agr_label = "High agreement" if eagr >= 75 else ("Partial agreement" if eagr >= 50 else "Mixed signals")
+
+    # ── Confidence bar ────────────────────────────────────────────────────────
+    conf_bar = (
+        f'<div style="background:#F3F4F6;border-radius:4px;height:5px;margin-top:4px;">'
+        f'<div style="width:{int(econf)}%;background:{ecol};height:5px;border-radius:4px;"></div></div>'
+    )
+
+    st.markdown(
+        '<div class="section-header">⚡ Enhanced Market Bias &mdash; '
+        'Options Flow + Price Confirmation + Term Structure + VIX</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"""
+<div style="
+    background:#fff;
+    border:2px solid {ecol};
+    border-radius:12px;
+    padding:14px 20px 12px 24px;
+    margin-bottom:14px;
+    position:relative;
+    box-shadow:0 2px 8px rgba(0,0,0,0.07);
+">
+  <!-- left accent bar -->
+  <div style="position:absolute;left:0;top:0;bottom:0;width:6px;
+       background:{ecol};border-radius:12px 0 0 12px;"></div>
+
+  <!-- Row 1: Direction badge + score + confidence chips -->
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+    <span style="font-size:16px;font-weight:900;color:#1A1A2E;">⚡ Enhanced Bias</span>
+    <span style="background:{ecol};color:#fff;border-radius:6px;
+          padding:4px 14px;font-size:14px;font-weight:800;letter-spacing:0.5px;">
+      {edir}
+    </span>
+    <span style="background:{ecol}22;color:{ecol};border:1px solid {ecol};
+          border-radius:6px;padding:2px 10px;font-size:13px;font-weight:800;">
+      {esc:+.0f} / 100
+    </span>
+    <span style="background:{agr_color}22;color:{agr_color};border:1px solid {agr_color};
+          border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700;">
+      {agr_label} ({int(eagr)}%)
+    </span>
+    <span style="margin-left:auto;font-size:10px;color:#9CA3AF;">
+      {nsig}/3 new signals live
+    </span>
+  </div>
+
+  <!-- Score bar -->
+  {score_bar}
+
+  <!-- Row 2: signal chips -->
+  <div style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 10px 0;">
+    {chips_html}
+  </div>
+
+  <!-- Row 3: confidence sub-bar -->
+  <div style="font-size:10px;color:#9CA3AF;margin-bottom:2px;">
+    Composite confidence: {econf:.0f}%
+  </div>
+  {conf_bar}
+
+  <!-- Row 4: detail lines -->
+  <div style="margin-top:10px;padding-top:10px;border-top:1px solid #F3F4F6;">
+    {details_html}
+  </div>
+
+  <!-- Footer note -->
+  <div style="font-size:10px;color:#9CA3AF;margin-top:8px;">
+    Weight: S3/4 flow 70% · VWAP+OR 10% · Term structure 10% · India VIX 10%
+    &nbsp;·&nbsp; v7 enhanced layer · existing engines unchanged
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Render the Enhanced Bias Panel at the top of the dashboard ───────────────
+_render_enhanced_bias_panel(
+    _enhanced_bias, _vwap_or_data, _ts_data, _vix_data, _combined_decision, spot, m
+)
+# ══ END ENHANCED BIAS PANEL ═══════════════════════════════════════════════════
 
 st.markdown(
     '<div class="section-header">&#128300; Greek Risk Framework &mdash; Intraday Bias &amp; Confidence Score</div>',
