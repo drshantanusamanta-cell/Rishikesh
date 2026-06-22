@@ -3989,24 +3989,15 @@ def _render_combined_bias_panel(cd: dict) -> None:
     # Divergence section (only if active)
     div_html = ""
     if div:
-        div_html = f"""
-        <div style="
-            background:{div['badge_bg']};
-            border:1.5px solid {div['color']};
-            border-radius:8px;
-            padding:8px 14px;
-            margin-top:10px;
-        ">
-          <span style="font-size:12px;font-weight:800;color:{div['color']};">
-            ⚠ {div['type']}
-          </span>
-          <div style="font-size:11.5px;color:#374151;margin-top:4px;">
-            {div['warning']}
-          </div>
-          <div style="font-size:11px;color:#6B7280;margin-top:3px;">
-            {div['detail']}
-          </div>
-        </div>"""
+        div_html = (
+            f'<div style="background:{div["badge_bg"]};border:1.5px solid {div["color"]};'
+            f'border-radius:8px;padding:8px 14px;margin-top:10px;">'
+            f'<span style="font-size:12px;font-weight:800;color:{div["color"]};">'
+            f'⚠ {div["type"]}</span>'
+            f'<div style="font-size:11.5px;color:#374151;margin-top:4px;">{div["warning"]}</div>'
+            f'<div style="font-size:11px;color:#6B7280;margin-top:3px;">{div["detail"]}</div>'
+            f'</div>'
+        )
 
     # Explanation lines HTML
     lines_html = "".join(
