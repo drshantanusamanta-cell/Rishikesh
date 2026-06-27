@@ -239,7 +239,7 @@ BIAS_WEIGHTS = {
 }
 
 METRIC_EXPLAIN = {
-    "Bias Score":      "Directional bias score from -100 to +100; positive favors bulls, negative favors bears.",
+    "Bias Score":      "Hedge-flow bias score (-100..+100) from the legacy compute_nifty_bias engine — uses SIGNED delta x OI (net_delta), so it reads dealer hedge-flow pressure, not writer positioning. Use the S3/4 / Combined Decision panels for the authoritative directional call.",
     "Confidence":      "Signal quality score based on regime, persistence, concentration, and wall behavior.",
     "Regime":          "Range/pin, trend/expansion, or transition inferred from gamma, IV, walls, and persistence.",
     "EV Ratio":        "Call vs put time value near spot; higher means call premium stronger, lower means put premium stronger.",
@@ -1860,8 +1860,14 @@ def compute_market_sentiments(history):
         else:           return "Bearish", RED
 
     def classify_nd_abs(nd):
-        if   nd >  5000: return "Bullish", GREEN
-        elif nd < -5000: return "Bearish", RED
+        # CHANGE 3 (audit fix): flipped to WRITING convention.
+        # net_delta = sum(call_oi*call_delta) + sum(put_oi*put_delta) with put_delta<0.
+        # nd > 0  =>  call-side delta-weighted OI dominant  =>  CALL WRITING  =>  BEARISH.
+        # nd < 0  =>  put-side  delta-weighted OI dominant  =>  PUT  WRITING  =>  BULLISH.
+        # (was previously treated as a buying-convention signal, which contradicts the
+        # S3/4 writer-positioning engine and the Combined Decision panel.)
+        if   nd >  5000: return "Bearish", RED
+        elif nd < -5000: return "Bullish", GREEN
         else:            return "SideWays", AMBER
 
     def classify_gex_abs(gex):
@@ -1892,7 +1898,8 @@ def compute_market_sentiments(history):
 
     vega_label,     vega_color     = classify_iv_abs(raw_iv)   if use_abs_iv  else classify_z(iv_z)
     oi_label,       oi_color       = classify_pcr_abs(raw_pcr) if use_abs_pcr else classify_z(-pcr_z)
-    strength_label, strength_color = classify_nd_abs(raw_nd)   if use_abs_nd  else classify_z(nd_z)
+    # CHANGE 3 (audit fix): negate nd_z to match writing convention (see classify_nd_abs).
+    strength_label, strength_color = classify_nd_abs(raw_nd)   if use_abs_nd  else classify_z(-nd_z)
     theta_label,    theta_color    = classify_gex_abs(raw_gex) if use_abs_gex else classify_z(gex_z)
 
     abs_score = (
@@ -1901,7 +1908,8 @@ def compute_market_sentiments(history):
         (1 if vega_label=="Bullish" else -1 if vega_label=="Bearish" else 0) * 2.5 +
         (1 if theta_label=="Bullish" else -1 if theta_label=="Bearish" else 0) * 2.0
     )
-    z_score_raw = (0.30 * nd_z + 0.25 * iv_z + 0.25 * (-pcr_z) + 0.20 * gex_z) * 5
+    # CHANGE 3 (audit fix): -nd_z to flip from buying convention to writing convention.
+    z_score_raw = (0.30 * (-nd_z) + 0.25 * iv_z + 0.25 * (-pcr_z) + 0.20 * gex_z) * 5
     all_flat = use_abs_iv and use_abs_pcr and use_abs_nd and use_abs_gex
     pos_score = round(float(np.clip(abs_score if all_flat else z_score_raw, -10, 10)), 2)
 
@@ -3681,19 +3689,35 @@ def compute_dw_composite_bias(bkt, expiry_str=None):
     gex_arr  = bkt["gex"]
     gf_arr   = bkt["gamma_flip"]
     spot_arr = bkt["spot"]
+    # CHANGE 4 (audit fix): use the RAW (un-decayed) net flow for normalization.
+    # `compute_dw_flow_buckets` exposes `net_flow_raw` alongside the decay-weighted
+    # `net_flow`. With DW_FLOW_DECAY=0.85, the decayed series grows monotonically
+    # under sustained flow (steady state ≈ X / (1-0.85) = 6.67X). Normalizing
+    # decayed flow_3 against decayed session_max therefore saturates near ±1.0
+    # after a few consistent buckets — destroying magnitude differentiation
+    # between "mild sustained" and "strong sustained" sessions.
+    # Using raw on both sides preserves the magnitude signal while keeping the
+    # decayed series available for the display label.
+    net_flow_raw = bkt.get("net_flow_raw", net_flow)  # fallback to decayed if missing
 
-    recent_flow   = net_flow[-1]
-    flow_3        = float(np.mean(net_flow[-3:])) if len(net_flow) >= 3 else recent_flow
-    session_range = max(abs(f) for f in net_flow) if any(f != 0 for f in net_flow) else 1.0
-    flow_norm     = max(-1.0, min(1.0, flow_3 / max(session_range, 1.0)))
-    c1_score      = round(flow_norm * 35, 1)
-    c1_label      = (f"Net Δ-flow (PUT−CALL): {flow_3:+,.0f}  "
-                     f"({'PUT dominant — bullish' if flow_3 > 0 else 'CALL dominant — bearish'})  "
-                     f"[session max: {session_range:,.0f}]")
+    recent_flow     = net_flow[-1]                                # decayed (for label)
+    flow_3          = float(np.mean(net_flow[-3:])) if len(net_flow) >= 3 else recent_flow   # decayed (for label)
+    recent_flow_raw = net_flow_raw[-1]
+    flow_3_raw      = float(np.mean(net_flow_raw[-3:])) if len(net_flow_raw) >= 3 else recent_flow_raw
+    session_range_raw = max(abs(f) for f in net_flow_raw) if any(f != 0 for f in net_flow_raw) else 1.0
+    session_range   = session_range_raw                           # for label consistency
 
-    if len(net_flow) >= 2:
-        accel      = net_flow[-1] - net_flow[-2]
-        accel_norm = max(-1.0, min(1.0, accel / max(session_range, 1.0)))
+    flow_norm = max(-1.0, min(1.0, flow_3_raw / max(session_range_raw, 1.0)))
+    c1_score  = round(flow_norm * 35, 1)
+    c1_label  = (f"Net Δ-flow (PUT−CALL): {flow_3:+,.0f}  "
+                 f"({'PUT dominant — bullish' if flow_3 > 0 else 'CALL dominant — bearish'})  "
+                 f"[session max (raw): {session_range:,.0f}]")
+
+    if len(net_flow_raw) >= 2:
+        # Acceleration: use RAW flow change so the signal reflects genuine
+        # per-bucket delta, not the smoothed decayed difference.
+        accel      = net_flow_raw[-1] - net_flow_raw[-2]
+        accel_norm = max(-1.0, min(1.0, accel / max(session_range_raw, 1.0)))
         c2_score   = round(accel_norm * 25, 1)
         c2_label   = (f"Flow accel (PUT−CALL): {accel:+,.0f}  "
                       f"({'PUT accelerating ↑' if accel_norm > 0.1 else 'CALL accelerating ↓' if accel_norm < -0.1 else 'steady →'})")
@@ -4205,8 +4229,12 @@ if payload is None:
 m        = payload["metrics"]
 spot     = payload["spot"]
 expiry   = payload["expiry"]
+# CHANGE 1 (audit fix): legacy bias is retained ONLY for its regime / vol_regime /
+# near_flip fields (which `strategy_recommendation` consumes for the FLIP / RANGE
+# / PINNED branches). Direction + confidence now come from the Combined Decision
+# panel (writer-positioning convention) — see the adapter below, set after
+# `_combined_decision` is computed.
 bias     = compute_nifty_bias(m, st.session_state.history)
-strat    = strategy_recommendation(bias, m, st.session_state.history)
 history  = st.session_state.history
 
 # Append history entry
@@ -4232,6 +4260,11 @@ st.session_state.history = history
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MARKET BIAS SUMMARY (top-level)
+# NOTE (CHANGE 2 audit fix): `bs`/`regime` here come from the legacy
+# `compute_nifty_bias` engine, which uses SIGNED delta × OI (net_delta). That
+# measures dealer hedge-flow pressure, NOT writer positioning. The number is
+# still useful as a hedge-flow read, but should not be interpreted as the
+# authoritative directional bias — that role belongs to the S3/4 engine below.
 # ─────────────────────────────────────────────────────────────────────────────
 bs              = bias["bias_score"]
 bc              = GREEN if bs > 15 else (RED if bs < -15 else AMBER)
@@ -4376,6 +4409,30 @@ if len(_bias_hist) >= 3:
     _s34_bias["signal_breakdown"]["S6 Velocity"] = round(_s6, 1)
 else:
     _velocity = 0.0; _accel = 0.0; _s6 = 0.0; _s34_score_v4 = _s34_score
+
+# ── CHANGE 1 (audit fix): Rewire strategy_recommendation to Combined Decision ──
+# The legacy `bias` dict (compute_nifty_bias) uses signed-delta net_delta as a
+# directional signal — that's a hedge-flow metric, not a writer-positioning
+# metric. The Combined Decision panel's `_s34_bias["direction"]` is the correct
+# writer-positioning read (|Δ|-weighted, put-writing = bullish convention).
+#
+# We preserve `regime / vol_regime / near_flip` from the legacy bias because
+# `strategy_recommendation` consumes them for the FLIP / RANGE / PINNED
+# branches (and those regime classifications come from `classify_gamma_regime`,
+# which is conceptually independent of the directional convention).
+#
+# We also preserve the legacy `confidence` (not `enhanced_conf`) because the
+# WAIT threshold `BIAS_WEIGHTS["confidence_min_strategy"]=35` was tuned against
+# the legacy ~73-max scale. Switching to enhanced_conf (0-100) would shift the
+# effective threshold — leave that for a follow-up calibration pass.
+_strat_bias = {
+    "direction":  _s34_bias.get("direction", "NEUTRAL"),
+    "confidence": bias.get("confidence", 0),
+    "regime":     bias.get("regime", "TRANSITION"),
+    "vol_regime": bias.get("vol_regime", "MID_VOL"),
+    "near_flip":  bias.get("near_flip", False),
+}
+strat = strategy_recommendation(_strat_bias, m, st.session_state.history)
 
 # ── v4 #4: Divergence Proximity Score (0-100) ─────────────────────────
 def _compute_divergence_proximity(s34_score, scenario_id, pcr, iv_rank):
@@ -4828,7 +4885,7 @@ _render_enhanced_bias_panel(
 # ══ END ENHANCED BIAS PANEL ═══════════════════════════════════════════════════
 
 st.markdown(
-    '<div class="section-header">&#128300; Greek Risk Framework &mdash; Intraday Bias &amp; Confidence Score</div>',
+    '<div class="section-header">&#128300; Greek Risk Framework &mdash; Hedge-Flow Pressure &amp; Confidence</div>',
     unsafe_allow_html=True)
 st.markdown(f"""
 <div style="background:#fff;border:1.5px solid {_grf['cc']};border-radius:10px;
@@ -5841,6 +5898,10 @@ else:
 st.markdown('<div class="section-header"> Section 2  Bias Engine · Strategy · Key Metrics</div>', unsafe_allow_html=True)
 
 # Gauge + header metrics
+# NOTE (CHANGE 2 audit fix): the "Hedge-Flow Bias" metric below is the legacy
+# signed-delta net_delta score. Treat it as a dealer hedge-pressure read, not
+# the authoritative directional call — that lives in the S3/4 / Combined
+# Decision panels further down.
 header_cols = st.columns(8)
 metric_defs = [
     ("Symbol",      SYMBOL,                      ACCENT),
@@ -5848,7 +5909,7 @@ metric_defs = [
     ("Expiry",      expiry,                       MUTED),
     ("ATM IV",      f"{m['atm_iv']:.2f}%",       CYAN),
     ("ATM Strike",  int(m['atm']),                BLUE),
-    ("Bias",        f"{bs:+.1f}",                bc),
+    ("Hedge-Flow Bias", f"{bs:+.1f}",            bc),
     ("Confidence",  f"{bias['confidence']:.0f}%", BLUE),
     ("Regime",      regime[:12],                  AMBER),
 ]
@@ -5868,7 +5929,7 @@ with bias_col:
         mode="gauge+number",
         value=bs,
         domain={"x":[0,1],"y":[0,1]},
-        title={"text":"Bias Score","font":{"color":TEXT,"size":12}},
+        title={"text":"Hedge-Flow Bias (signed Δ×OI)","font":{"color":TEXT,"size":12}},
         number={"font":{"color":bc,"size":34}},
         gauge={
             "axis":{"range":[-100,100],"tickcolor":"#444"},
