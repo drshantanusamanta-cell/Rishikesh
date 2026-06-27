@@ -1550,7 +1550,7 @@ def compute_nifty_bias(m, history=None):
 
 
 # ─── Section 3 & 4 Bias Engine ───────────────────────────────────────────────
-def compute_section34_bias(df_band_records, m, spot, roll_discount=1.0):
+def compute_section34_bias(df_band_records, m, spot, roll_discount=1.0, front_expiry=None, skew_baseline=None):
     """
     5-signal market bias from Section 3 (metrics) + Section 4 (±10 strike band).
     Score range: -100 (strongly bearish) to +100 (strongly bullish).
@@ -1704,10 +1704,10 @@ def compute_section34_bias(df_band_records, m, spot, roll_discount=1.0):
         raw_skew  = valid_piv.mean() - valid_civ.mean()   # positive = put fear premium
         norm_skew = (raw_skew / atm_iv_level) * 100.0     # as % of ATM IV
 
-        # Normal Nifty norm_skew ≈ 20–40%; midpoint baseline = 30%.
-        # Signal fires only for excess beyond this neutral zone.
-        # Calibrate NORMAL_SKEW_BASELINE after observing a few calm sessions.
-        NORMAL_SKEW_BASELINE = 30.0
+        # Fix #4: Use caller-supplied adaptive baseline (trailing median of norm_skew
+        # over recent neutral sessions from bias history). Falls back to 30.0 when
+        # insufficient history exists (first boot, cold start, etc.).
+        NORMAL_SKEW_BASELINE = skew_baseline if skew_baseline is not None else 30.0
         excess = norm_skew - NORMAL_SKEW_BASELINE
         # 20 pct-pt excess maps to full ±9 level score
         s4 = max(-9.0, min(9.0, -(excess / 20.0) * 9.0))
@@ -1753,7 +1753,7 @@ def compute_section34_bias(df_band_records, m, spot, roll_discount=1.0):
         "direction":   direction,
         "quality_strikes_count":  _qcount,
         "roll_discount_applied":  round(roll_discount, 2),
-        "roll_window_active":     is_roll_window(),
+        "roll_window_active":     is_roll_window(front_expiry),  # Fix #3: pass expiry for dynamic weekday
         # v4.1: norm_skew returned so caller can anchor intraday delta (Option 2)
         "norm_skew":   round(norm_skew, 2),
         "signal_breakdown": {
@@ -2545,7 +2545,7 @@ def fetch_back_expiry_atm_iv(back_expiry: str):
 
 
 # ─── Roll Detection — Inter-Expiry OI Comparison ────────────────────────────
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)  # Fix #5: was ttl=60; 5-min matches fetch_back_expiry_atm_iv and avoids rate-limit pressure
 def fetch_back_expiry_oi_band(back_expiry: str):
     """
     Fetch strike-level OI + OI change for the back expiry — lightweight version.
@@ -2605,16 +2605,34 @@ def fetch_back_expiry_oi_band(back_expiry: str):
         return pd.DataFrame()
 
 
-def is_roll_window() -> bool:
+def is_roll_window(front_expiry_str: str = None) -> bool:
     """
-    True during the mechanical weekly roll window:
-    Tuesday 14:00 IST → Wednesday 15:30 IST (Nifty expiry is Tuesday).
-    During this window institutional desks systematically roll front-week
-    positions to the next expiry, making OI momentum signals unreliable.
+    Fix #3: Derive roll window from actual expiry date rather than hardcoded Tuesday.
+
+    When front_expiry_str is supplied the expiry weekday is read from the date,
+    so the function stays correct if SEBI ever moves the weekly settlement day again.
+    Falls back to the current hardcoded schedule (Tuesday) when no expiry is given.
+
+    Roll window = afternoon of the day-before-expiry (14:00 IST → EOD) + all of expiry day.
     """
-    n = now_ist()
+    n  = now_ist()
     wd = n.weekday()   # 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
     hm = (n.hour, n.minute)
+
+    if front_expiry_str:
+        try:
+            _exp_dt   = date.fromisoformat(front_expiry_str)
+            expiry_wd = _exp_dt.weekday()         # weekday of expiry (e.g. 1 = Tuesday)
+            prev_wd   = (expiry_wd - 1) % 7      # day before expiry (e.g. 0 = Monday)
+            if wd == prev_wd and hm >= (14, 0):  # afternoon roll-start
+                return True
+            if wd == expiry_wd:                  # all of expiry day
+                return True
+            return False
+        except Exception:
+            pass  # malformed expiry string — fall through to hardcoded default
+
+    # Hardcoded fallback: NIFTY 50 expiry = Tuesday (SEBI schedule since Sep 2023)
     if wd == 1 and hm >= (14, 0):   # Tuesday afternoon
         return True
     if wd == 2:                      # All day Wednesday
@@ -3962,7 +3980,7 @@ def compute_raw_oi_buckets(sym_history):
     }
 
 
-def compute_gamma_blast_monitor(bkt: dict, m: dict, alert: dict) -> dict:
+def compute_gamma_blast_monitor(bkt: dict, m: dict, alert: dict, spot_px: float = 0.0) -> dict:
     """
     Compute a gamma blast risk score (0-100) and stage from existing Section 9 signals.
     Identical logic to the Dash app version — grounded in already-computed values only.
@@ -3980,7 +3998,10 @@ def compute_gamma_blast_monitor(bkt: dict, m: dict, alert: dict) -> dict:
     gflip    = safe_num(m.get("gamma_flip", 0))
     wall_w   = safe_num(m.get("wall_width", 400))
     gt_ratio = safe_num(m.get("gt_ratio", 0))
-    spot     = safe_num(m.get("spot", 0))
+    # Fix #1: m dict from compute_metrics() never has a "spot" key.
+    # Use the explicitly passed spot_px (module-level `spot` from payload).
+    # Fall back to ATM strike (≈ spot within ±25 pts) so the score is always live.
+    spot     = safe_num(spot_px) if spot_px else safe_num(m.get("atm", 0))
 
     # ── Stage 1 (max 30 pts) ──────────────────────────────────────────────────
     if gex < 0:
@@ -4797,6 +4818,37 @@ if not history or history[-1].get("_fetch_ts", 0) != _payload_fetch_ts:
 history = history[-500:]
 st.session_state.history = history
 
+# ── Fix #2: today-only history for session-sensitive intraday functions ───────
+# Full `history` (up to 500 ticks, multi-day) is kept for compute_temporal_iv_rank
+# which needs cross-day context to compute a meaningful IV percentile.
+# All session-bucketed functions (DW flow, raw OI, sentiments, Section 5 baseline)
+# only make sense within the current trading day — yesterday's 09:30 bucket must
+# not merge with today's 09:30.
+_today_str    = date.today().isoformat()                           # e.g. "2026-06-27"
+today_history = [h for h in history if h.get("ts", "").startswith(_today_str)]
+# ── end Fix #2 setup ──────────────────────────────────────────────────────────
+
+# ── Fix #4: Adaptive NORMAL_SKEW_BASELINE ─────────────────────────────────────
+# Compute a trailing median of norm_skew over recent neutral-regime sessions
+# (|s34_score| < 20) from persisted bias history, rather than using the hardcoded
+# value of 30.0.  Requires norm_skew to be stored in bias_history entries
+# (added below in the bias-history append block).  Falls back to 30.0 until
+# ≥5 neutral-session data points accumulate.
+_bh_for_baseline = _load_bias_history()   # mtime-cached — cheap second call
+_neutral_skews = [
+    float(x["norm_skew"])
+    for x in _bh_for_baseline
+    if abs(safe_num(x.get("score", 999))) < 20   # neutral session
+    and isinstance(x.get("norm_skew"), (int, float))
+]
+if len(_neutral_skews) >= 5:
+    _adaptive_skew_baseline = round(
+        float(sorted(_neutral_skews)[len(_neutral_skews) // 2]), 1   # median
+    )
+else:
+    _adaptive_skew_baseline = 30.0   # not enough history yet — use default
+# ── end Fix #4 setup ──────────────────────────────────────────────────────────
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MARKET BIAS SUMMARY (top-level)
 # NOTE (CHANGE 2 audit fix): `bs`/`regime` here come from the legacy
@@ -4818,7 +4870,10 @@ _back_oi_band_df   = fetch_back_expiry_oi_band(_roll_back_exp) if _roll_back_exp
 _front_df_for_roll = pd.DataFrame(payload["df_band"]) if payload.get("df_band") else None
 _roll_data         = detect_roll_activity(_front_df_for_roll, _back_oi_band_df, spot)
 _s34_bias = compute_section34_bias(
-    payload["df_band"], m, spot, roll_discount=_roll_data["momentum_discount"]
+    payload["df_band"], m, spot,
+    roll_discount=_roll_data["momentum_discount"],
+    front_expiry=_expiry_list[0] if _expiry_list else None,   # Fix #3: dynamic roll weekday
+    skew_baseline=_adaptive_skew_baseline,                     # Fix #4: adaptive S4 baseline
 )
 _s34_score = _s34_bias["bias_score"]
 _s34_breakdown = _s34_bias.get("signal_breakdown", {})
@@ -5111,6 +5166,8 @@ if _payload_fetch_ts != _last_bh_fetch_ts:
         "s4":        _s34_breakdown.get("S4 IV Skew",    0.0),
         "s5":        _s34_breakdown.get("S5 Term Str",   0.0),
         "s6":        _s34_breakdown.get("S6 Velocity",   0.0),
+        # Fix #4: store norm_skew so adaptive NORMAL_SKEW_BASELINE can self-calibrate
+        "norm_skew": float(_s34_bias.get("norm_skew", 30.0)),
     })
     st.session_state.bias_history = _bh_tmp[-60:]   # ~5 hrs at data-refresh cadence
     st.session_state.bias_history_last_ts = _now_bias
@@ -6410,7 +6467,7 @@ if not df_band.empty:
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown('<div class="section-header"> Section 1  Market Sentiments</div>', unsafe_allow_html=True)
 
-s = compute_market_sentiments(history)
+s = compute_market_sentiments(today_history)  # Fix #2: intraday only
 if s:
     sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
     for col, label, val, color in [
@@ -6605,9 +6662,9 @@ with vel_col:
     """, unsafe_allow_html=True)
 
 # IV History chart + OI Velocity charts
-if len(history) >= 3:
+if len(today_history) >= 3:  # Fix #2: intraday only
     # Build 15-min bucketed history charts
-    hist_df = pd.DataFrame(history)
+    hist_df = pd.DataFrame(today_history)  # Fix #2: intraday only
     def bucket_series(key):
         try:
             t = pd.to_datetime(hist_df["ts"], errors="coerce")
@@ -6628,8 +6685,8 @@ if len(history) >= 3:
     # Call/Put OI velocity z-score 15-min
     def compute_vel_buckets(side_key, total_key):
         try:
-            arr = np.array([safe_num(x.get(total_key,0)) for x in history], dtype=float)
-            ts  = [x.get("ts","") for x in history]
+            arr = np.array([safe_num(x.get(total_key,0)) for x in today_history], dtype=float)  # Fix #2
+            ts  = [x.get("ts","") for x in today_history]  # Fix #2
             vel = np.diff(arr); ts_v = ts[1:]
             buckets = {}
             for i, t in enumerate(ts_v):
@@ -6723,8 +6780,8 @@ st.markdown(
 )
 
 if len(history) >= 2:
-    bkt  = compute_dw_flow_buckets(history)
-    rbkt = compute_raw_oi_buckets(history)
+    bkt  = compute_dw_flow_buckets(today_history)   # Fix #2: intraday only
+    rbkt = compute_raw_oi_buckets(today_history)    # Fix #2: intraday only
 
     if bkt and len(bkt.get("labels", [])) >= 1:
         labels        = bkt["labels"]
@@ -7259,7 +7316,7 @@ if len(history) >= 2:
 
         # Compute gamma blast monitor
         _alert_for_gbm = compute_pre_move_alert(m, history)
-        gbm = compute_gamma_blast_monitor(bkt, m, _alert_for_gbm)
+        gbm = compute_gamma_blast_monitor(bkt, m, _alert_for_gbm, spot_px=spot)  # Fix #1
 
         bias_col, blast_col = st.columns(2)
 
@@ -7441,8 +7498,8 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown('<div class="section-header"> Section 5  Intraday Cumulative Metrics (15-min buckets, IST)</div>', unsafe_allow_html=True)
 
-if len(history) >= 3:
-    hist_df2 = pd.DataFrame(history)
+if len(today_history) >= 3:  # Fix #2: intraday only — prevents yesterday's first tick becoming the baseline
+    hist_df2 = pd.DataFrame(today_history)  # Fix #2
     try:
         t2 = pd.to_datetime(hist_df2["ts"], errors="coerce")
         hist_df2 = hist_df2.assign(t=t2)
