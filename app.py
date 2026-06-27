@@ -5,7 +5,7 @@
 ║  Data: Dhan API (primary) | Demo Mode (fallback)                    ║
 ║  NIFTY 50 + NIFTY Futures ONLY                                      ║
 ║  Bias Score: -100 to +100 | Regime | Strategy Engine               ║
-║  v4 — All 10 Leading Bias Improvements Applied                     ║
+║  v6 — Hardened Edition: CI #2-10 + H1-H26 audit fixes applied      ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -59,11 +59,29 @@ def is_market_hours():
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Shantanu's Options Dashboard  NIFTY",
-    page_icon="",
+    page_title="Shantanu's Options Dashboard — NIFTY",   # H21 fix: was mojibake (\x97 where em-dash should be)
+    page_icon="📊",   # H21 fix: was empty — browser showed default favicon
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# CI #5 fix: register auto-refresh IMMEDIATELY after set_page_config, BEFORE any
+# st.stop() can fire downstream. The previous location (very end of script) meant
+# that if Dhan returned an error → `st.stop()` halted execution →
+# `st_autorefresh` never registered → the page would not auto-recover from a
+# transient API failure; the user had to manually reload the browser.
+# Registering early guarantees the page re-runs every 60s regardless of any
+# downstream st.stop() or exception.
+#
+# H18 FOLLOW-UP (not applied in this pass): migrating from `streamlit_autorefresh`
+# to native `st.fragment(run_every=60.0)` (Streamlit ≥1.33) would cut per-rerun
+# work by ~80% — only the data-fetch + history-append logic would re-execute,
+# not the entire 7000-line script. This is a larger refactor (requires wrapping
+# the fetch logic in a fragment function and reading results from
+# st.session_state in the main body) and should be done as a separate PR.
+# For now, st_autorefresh at the top is the safe fix that preserves all existing
+# behavior while solving the st.stop() recovery problem.
+st_autorefresh(interval=60_000, key="nifty_autorefresh")
 
 
 # ─── Credentials ──────────────────────────────────────────────────────────────
@@ -107,11 +125,22 @@ def _render_owner_sidebar(expiry_list):
     - Locked state  → PIN entry form only.
     - Unlocked state → expiry selector, refresh interval, manual refresh button.
     Returns (sel_expiry, manual_refresh_clicked).
+
+    CI #3 fix: if OWNER_PIN secret is not configured, the unlock form is hidden
+    entirely (fail-closed) — there is NO default PIN. A misconfigured deploy
+    cannot expose owner controls to public visitors.
     """
-    correct_pin = _get_secret("OWNER_PIN", "12345")
+    import hmac
+    correct_pin = _get_secret("OWNER_PIN", None)   # CI #3 fix: was "12345"
 
     if "owner_unlocked" not in st.session_state:
         st.session_state.owner_unlocked = False
+
+    # CI #3 fix: brute-force lockout — 5 failed attempts → 5-min cooldown
+    if "owner_pin_fail_count" not in st.session_state:
+        st.session_state.owner_pin_fail_count = 0
+    if "owner_pin_lock_until" not in st.session_state:
+        st.session_state.owner_pin_lock_until = 0.0
 
     # Smart default for refresh (set once, survives reruns)
     if "refresh_seconds" not in st.session_state:
@@ -125,17 +154,37 @@ def _render_owner_sidebar(expiry_list):
     with st.sidebar:
         st.markdown("### ⚙️ Owner Controls")
 
+        # CI #3 fix: if PIN isn't configured, hide the entire owner section.
+        if correct_pin is None:
+            st.caption("🔒 Owner controls disabled (no OWNER_PIN configured).")
+            st.caption(" Dashboard is in **read-only** mode for all visitors.")
+            return sel_expiry, manual_refresh_clicked
+
         if not st.session_state.owner_unlocked:
-            # ── Locked: show PIN form ──────────────────────────────────────────
-            st.caption("Enter PIN to access advanced settings.")
-            pin = st.text_input("Owner PIN", type="password",
-                                key="owner_pin_input", placeholder="Enter owner PIN")
-            if st.button("Unlock", width='stretch', type="primary", key="owner_unlock_btn"):
-                if pin == correct_pin:
-                    st.session_state.owner_unlocked = True
-                    st.rerun()
-                else:
-                    st.error("❌ Incorrect PIN")
+            # CI #3 fix: brute-force lockout check
+            _now_ts = time.time()
+            if _now_ts < st.session_state.owner_pin_lock_until:
+                _mins_left = int((st.session_state.owner_pin_lock_until - _now_ts) / 60) + 1
+                st.warning(f"⏱️ Too many failed attempts. Try again in {_mins_left} min.")
+            else:
+                st.caption("Enter PIN to access advanced settings.")
+                pin = st.text_input("Owner PIN", type="password",
+                                    key="owner_pin_input", placeholder="Enter owner PIN")
+                if st.button("Unlock", width='stretch', type="primary", key="owner_unlock_btn"):
+                    # CI #3 fix: constant-time comparison (timing-attack resistance)
+                    if pin and hmac.compare_digest(pin, correct_pin):
+                        st.session_state.owner_unlocked = True
+                        st.session_state.owner_pin_fail_count = 0
+                        st.rerun()
+                    else:
+                        st.session_state.owner_pin_fail_count += 1
+                        if st.session_state.owner_pin_fail_count >= 5:
+                            st.session_state.owner_pin_lock_until = _now_ts + 300   # 5 min
+                            st.session_state.owner_pin_fail_count = 0
+                            st.error("❌ Too many failed attempts. Locked for 5 minutes.")
+                        else:
+                            st.error(f"❌ Incorrect PIN (attempt "
+                                     f"{st.session_state.owner_pin_fail_count}/5)")
             st.divider()
             st.caption(" Dashboard is in **read-only** mode for guests.")
 
@@ -191,6 +240,10 @@ def _render_owner_sidebar(expiry_list):
             st.divider()
             if st.button(" Lock", key="owner_lock_btn", width='stretch'):
                 st.session_state.owner_unlocked = False
+                # CI #3 fix: clear the PIN input so the next visitor can't re-unlock
+                # by clicking Unlock without re-entering the PIN.
+                if "owner_pin_input" in st.session_state:
+                    del st.session_state["owner_pin_input"]
                 st.rerun()
 
     return sel_expiry, manual_refresh_clicked
@@ -314,11 +367,21 @@ def _solve_iv(mkt_price, S, K, T, r, opt):
 
 
 def safe_num(x, d=0.0):
+    """H5 fix: also reject ±inf (was only None / NaN before).
+
+    ±inf in metrics propagates to json.dump which (with default allow_nan=True)
+    writes the literal `Infinity` / `NaN` token — invalid per RFC 8259 and
+    unparseable by non-Python tools. Combined with allow_nan=False in
+    _atomic_json_write (CI #6), this guarantees persisted history stays clean.
+    """
     try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
+        if x is None:
             return d
-        return float(x)
-    except Exception:
+        v = float(x)
+        if np.isnan(v) or np.isinf(v):
+            return d
+        return v
+    except (TypeError, ValueError):
         return d
 
 
@@ -342,6 +405,14 @@ def compute_true_gex(df, spot):
 
 
 def compute_iv_rank(df, atm):
+    """Cross-sectional IV rank within the current smile.
+
+    Returns (smile_position_pct, iv_pct). This is a SMILE-POSITION metric, NOT a
+    temporal IV rank — for a normal NIFTY smile where ATM sits near the IV
+    minimum, this value is close to 0 most of the time. Use compute_temporal_iv_rank()
+    for any vol-regime / strategy decision that depends on whether IV is
+    historically high or low.
+    """
     if df is None or df.empty:
         return 0.0, 0.0
     avg_iv = ((df["call_iv"].replace(0, np.nan) + df["put_iv"].replace(0, np.nan)) / 2).dropna()
@@ -350,7 +421,13 @@ def compute_iv_rank(df, atm):
     row = df[df["strike"] == atm]
     if row.empty:
         row = df.iloc[[(df["strike"] - atm).abs().idxmin()]]
-    atm_iv = float((safe_num(row["call_iv"].iloc[0]) + safe_num(row["put_iv"].iloc[0])) / 2)
+    # CI #2 fix part A: robust non-zero average for ATM IV (was biased by zeros).
+    _c = safe_num(row["call_iv"].iloc[0])
+    _p = safe_num(row["put_iv"].iloc[0])
+    if _c > 0 or _p > 0:
+        atm_iv = (_c + _p) / max(1, (_c > 0) + (_p > 0))
+    else:
+        atm_iv = 0.0
     iv_min, iv_max = float(avg_iv.min()), float(avg_iv.max())
     if iv_max <= iv_min:
         return 0.0, 0.0
@@ -359,16 +436,74 @@ def compute_iv_rank(df, atm):
     return iv_rank, iv_pct
 
 
+# ── CI #2 fix: True temporal IV rank from persisted history ─────────────────
+# `nifty_history.json` records `atm_iv` per tick (see build_history_entry, L3239).
+# We compute a trailing-N-day rank: rank = (now - min) / (max - min) * 100.
+# Falls back to the cross-sectional smile_position (with a flag) if history is
+# too short or contains no IV variation.
+TEMPORAL_IVR_LOOKBACK_DAYS = 20    # ~1 trading month
+TEMPORAL_IVR_MIN_SAMPLES   = 10   # need at least this many distinct days
+
+def compute_temporal_iv_rank(current_atm_iv, history=None):
+    """
+    Returns (temporal_iv_rank, is_temporal).
+      temporal_iv_rank: 0-100 rank of current_atm_iv vs trailing ~20d window.
+      is_temporal:      True if computed from real history,
+                        False if fell back to None (caller should use cross-sectional).
+    """
+    if current_atm_iv is None or current_atm_iv <= 0:
+        return None, False
+    if not history or len(history) < 2:
+        return None, False
+
+    # Build a series of (date, atm_iv) from history, deduplicating by date
+    # (one IV value per calendar day, taking the last sample of that day).
+    by_date = {}
+    for h in history:
+        iv = safe_num(h.get("atm_iv", 0))
+        if iv <= 0:
+            continue
+        ts = h.get("ts", "")
+        # ts format: "YYYY-MM-DDTHH:MM:SS"
+        d = ts.split("T")[0] if "T" in ts else ts[:10]
+        if d:
+            by_date[d] = iv   # later entries overwrite earlier — keeps last sample of day
+
+    if len(by_date) < TEMPORAL_IVR_MIN_SAMPLES:
+        return None, False
+
+    # Take the trailing N days (sorted by date)
+    sorted_dates = sorted(by_date.keys())
+    window_dates = sorted_dates[-TEMPORAL_IVR_LOOKBACK_DAYS:]
+    window_ivs   = [by_date[d] for d in window_dates]
+
+    iv_min = min(window_ivs)
+    iv_max = max(window_ivs)
+    if iv_max - iv_min < 0.5:    # <0.5 vol-point spread — insufficient variation
+        return None, False
+
+    rank = round((current_atm_iv - iv_min) / (iv_max - iv_min) * 100, 1)
+    rank = max(0.0, min(100.0, rank))
+    return rank, True
+
+
 def classify_gamma_regime(gex, wall_width, momentum, atm_iv, iv_rank, spot, gamma_flip):
+    # H13 fix: convert absolute-point thresholds to % of spot. As NIFTY drifts
+    # (22k → 25k), 300 pts went from 1.36% to 1.20% of spot — the regime
+    # classifier became arbitrarily stricter simply because the index rose.
+    # Now: 300 pts ≈ 1.3% band; 400 pts ≈ 1.7% band; 500 momentum units stays
+    # absolute (it's an OI-delta unit, not a price unit).
+    spot_pct = lambda abs_pts: (abs_pts / max(spot, 1)) * 100.0   # converts pts → % of spot
     flip_dist = abs(spot - gamma_flip) if gamma_flip is not None else 9999
     _strike_step = max(wall_width / 20, 50) if wall_width > 0 else 50
     near_flip = flip_dist < max(2.0 * _strike_step, 100) if gamma_flip is not None else False
     if iv_rank >= 70:   vol_regime = "HIGH_VOL"
     elif iv_rank <= 30: vol_regime = "LOW_VOL"
     else:               vol_regime = "MID_VOL"
-    if   gex > 0 and wall_width <= 300 and vol_regime == "LOW_VOL":
+    wall_width_pct = spot_pct(wall_width)
+    if   gex > 0 and wall_width_pct <= 1.3 and vol_regime == "LOW_VOL":
         return "PINNED / RANGE",       vol_regime, near_flip
-    elif gex > 0 and wall_width <= 400:
+    elif gex > 0 and wall_width_pct <= 1.7:
         return "RANGE / PIN",          vol_regime, near_flip
     elif gex < 0 and abs(momentum) > 500 and vol_regime in ("MID_VOL", "HIGH_VOL"):
         return "TREND / EXPANSION",    vol_regime, near_flip
@@ -379,75 +514,166 @@ def classify_gamma_regime(gex, wall_width, momentum, atm_iv, iv_rank, spot, gamm
 
 
 # ─── Data fetchers ────────────────────────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_dhan_expiry_list():
-    import requests
+# H1+H2+H3 fix: shared Dhan HTTP helper. Centralizes:
+#   - status-code checking via raise_for_status (H1)
+#   - status=="success" body validation (H2)
+#   - retry+backoff via urllib3 Retry (H3) — 3 retries, exponential backoff,
+#     honors 429 / 5xx. Mounted on a module-level Session so connection pooling
+#     works across fetchers.
+import requests as _requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except ImportError:                                # pragma: no cover
+    Retry = None
+
+_dhan_session = None
+_dhan_session_lock = threading.Lock()
+
+def _get_dhan_session():
+    """H3 fix: return a Session with retry/backoff mounted. Thread-safe singleton."""
+    global _dhan_session
+    if _dhan_session is not None:
+        return _dhan_session
+    with _dhan_session_lock:
+        if _dhan_session is None:
+            s = _requests.Session()
+            if Retry is not None:
+                retry = Retry(
+                    total=3,
+                    backoff_factor=0.5,            # 0.5, 1, 2 seconds
+                    status_forcelist=(429, 500, 502, 503, 504),
+                    allowed_methods=("GET", "POST"),
+                    respect_retry_after_header=True,
+                )
+                adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+                s.mount("https://", adapter)
+                s.mount("http://",  adapter)
+            _dhan_session = s
+    return _dhan_session
+
+
+class DhanAPIError(Exception):
+    """Raised when Dhan returns a non-success response body or HTTP error."""
+    pass
+
+
+def _dhan_post(url, payload, timeout=15):
+    """H1+H2+H3 fix: POST to a Dhan endpoint with full validation + retry.
+
+    Returns the parsed JSON body on success.
+    Raises DhanAPIError on HTTP error, non-success body, or network failure.
+    """
     if not USE_DHAN:
-        return []
+        raise DhanAPIError("Dhan credentials not configured")
     sec = DHAN_SECURITY["NIFTY"]
     headers = {
         "access-token": DHAN_ACCESS_TOKEN,
-        "client-id": str(DHAN_CLIENT_ID),
+        "client-id":    str(DHAN_CLIENT_ID),
         "Content-Type": "application/json",
     }
+    sess = _get_dhan_session()
     try:
-        resp = requests.post(
+        resp = sess.post(url, headers=headers, json=payload, timeout=timeout)
+    except _requests.RequestException as e:
+        raise DhanAPIError(f"network error: {e}")
+
+    # H1 fix: check HTTP status code (was missing — JSONDecodeError was silently swallowed)
+    if resp.status_code >= 400:
+        # Try to extract error message from body, fall back to status text
+        try:
+            body = resp.json()
+            msg = body.get("errorMessage") or body.get("message") or body
+        except Exception:
+            msg = resp.text[:200] if resp.text else resp.reason
+        raise DhanAPIError(f"HTTP {resp.status_code}: {msg}")
+
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise DhanAPIError(f"invalid JSON response: {e}")
+
+    # H2 fix: validate status=="success" envelope (only for /v2 endpoints;
+    # the scrip-master CSV is fetched separately via _load_dhan_instrument_master)
+    if "status" in data and data.get("status") != "success":
+        err = data.get("errorMessage") or data.get("errorCode") or data.get("status")
+        raise DhanAPIError(f"Dhan status={data.get('status')}: {err}")
+
+    return data
+
+
+def _dhan_get_csv(url, timeout=25):
+    """H1+H3 fix: GET a CSV (used for the instrument master). Returns the text."""
+    sess = _get_dhan_session()
+    try:
+        resp = sess.get(url, timeout=timeout)
+        resp.raise_for_status()           # H1 fix
+        return resp.text
+    except _requests.RequestException as e:
+        raise DhanAPIError(f"network error fetching CSV: {e}")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_dhan_expiry_list():
+    if not USE_DHAN:
+        return []
+    sec = DHAN_SECURITY["NIFTY"]
+    try:
+        data = _dhan_post(
             "https://api.dhan.co/v2/optionchain/expirylist",
-            headers=headers,
-            json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]},
+            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]},
             timeout=15,
         )
-        data = resp.json()
         expiries = data.get("data", []) or []
         today = date.today().isoformat()
         return [e for e in expiries if e >= today]
-    except Exception as e:
+    except (DhanAPIError, Exception) as e:
+        # H1+M9 fix: log the exception (was silently swallowed)
+        try:
+            print(f"[fetch_dhan_expiry_list] error: {e}", flush=True)
+        except Exception:
+            pass
         return []
 
 
 def fetch_dhan_option_chain(expiry=None):
-    import requests
     if not USE_DHAN:
         return pd.DataFrame(), 0.0, ""
 
     sec = DHAN_SECURITY["NIFTY"]
-    headers = {
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id": str(DHAN_CLIENT_ID),
-        "Content-Type": "application/json",
-    }
 
     if expiry is None:
         try:
-            exp_resp = requests.post(
+            exp_data = _dhan_post(
                 "https://api.dhan.co/v2/optionchain/expirylist",
-                headers=headers,
-                json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]},
+                {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]},
                 timeout=15,
             )
-            exp_data = exp_resp.json()
             expiries = exp_data.get("data", []) or []
             today = date.today().isoformat()
             future = [e for e in expiries if e >= today]
             expiry = future[0] if future else ""
-        except Exception:
+        except (DhanAPIError, Exception) as e:
+            try:
+                print(f"[fetch_dhan_option_chain] expiry list error: {e}", flush=True)
+            except Exception:
+                pass
             return pd.DataFrame(), 0.0, ""
 
     if not expiry:
         return pd.DataFrame(), 0.0, ""
 
     try:
-        oc_resp = requests.post(
+        resp = _dhan_post(
             "https://api.dhan.co/v2/optionchain",
-            headers=headers,
-            json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"], "Expiry": expiry},
+            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"], "Expiry": expiry},
             timeout=20,
         )
-        resp = oc_resp.json()
-    except Exception:
-        return pd.DataFrame(), 0.0, expiry
-
-    if resp.get("status") != "success":
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_dhan_option_chain] chain fetch error: {e}", flush=True)
+        except Exception:
+            pass
         return pd.DataFrame(), 0.0, expiry
 
     data = resp.get("data", {}) or {}
@@ -456,6 +682,15 @@ def fetch_dhan_option_chain(expiry=None):
 
     oc = data.get("oc", {}) or {}
     rows = []
+    # H6 fix: use int(float(...)) for OI parsing. Previously int(ce.get("oi", 0) or 0)
+    # raised ValueError on schema drift (e.g., "12345.0" string), discarding the
+    # entire option chain for that cycle.
+    def _safe_int(v):
+        try:
+            return int(float(v or 0))
+        except (TypeError, ValueError):
+            return 0
+
     for strike_str, chain in oc.items():
         K = safe_num(strike_str, 0)
         ce = (chain or {}).get("ce", {}) or {}
@@ -465,10 +700,10 @@ def fetch_dhan_option_chain(expiry=None):
         rows.append({
             "strike": K,
             "call_ltp": safe_num(ce.get("last_price", 0)),
-            "call_oi": int(ce.get("oi", 0) or 0),
-            "call_prev_oi": int(ce.get("previous_oi", 0) or 0),
-            "call_oi_chg": int(ce.get("oi", 0) or 0) - int(ce.get("previous_oi", 0) or 0),
-            "call_vol": int(ce.get("volume", 0) or 0),
+            "call_oi": _safe_int(ce.get("oi", 0)),                       # H6 fix
+            "call_prev_oi": _safe_int(ce.get("previous_oi", 0)),         # H6 fix
+            "call_oi_chg": _safe_int(ce.get("oi", 0)) - _safe_int(ce.get("previous_oi", 0)),
+            "call_vol": _safe_int(ce.get("volume", 0)),                  # H6 fix
             "call_bid": safe_num(ce.get("top_bid_price", 0)),
             "call_ask": safe_num(ce.get("top_ask_price", 0)),
             "call_iv": safe_num(ce.get("implied_volatility", 0)),
@@ -477,10 +712,10 @@ def fetch_dhan_option_chain(expiry=None):
             "call_theta": safe_num(cg.get("theta", 0)),
             "call_vega": safe_num(cg.get("vega", 0)),
             "put_ltp": safe_num(pe.get("last_price", 0)),
-            "put_oi": int(pe.get("oi", 0) or 0),
-            "put_prev_oi": int(pe.get("previous_oi", 0) or 0),
-            "put_oi_chg": int(pe.get("oi", 0) or 0) - int(pe.get("previous_oi", 0) or 0),
-            "put_vol": int(pe.get("volume", 0) or 0),
+            "put_oi": _safe_int(pe.get("oi", 0)),                        # H6 fix
+            "put_prev_oi": _safe_int(pe.get("previous_oi", 0)),          # H6 fix
+            "put_oi_chg": _safe_int(pe.get("oi", 0)) - _safe_int(pe.get("previous_oi", 0)),
+            "put_vol": _safe_int(pe.get("volume", 0)),                   # H6 fix
             "put_bid": safe_num(pe.get("top_bid_price", 0)),
             "put_ask": safe_num(pe.get("top_ask_price", 0)),
             "put_iv": safe_num(pe.get("implied_volatility", 0)),
@@ -491,16 +726,23 @@ def fetch_dhan_option_chain(expiry=None):
         })
 
     if spot == 0 and oc:
+        # H8 fix: use proper put-call parity S = C - P + K (median across
+        # strikes with both sides having positive LTP). The previous logic
+        # returned the strike K where |C-P| was smallest, which is just the
+        # ATM strike (rounded to NIFTY_STEP) — a 17-pt error at spot 24517.
         try:
-            parity = {}
+            spot_estimates = []
             for strike_str, chain in oc.items():
                 K = safe_num(strike_str, 0)
                 ce_ltp = safe_num((chain or {}).get("ce", {}).get("last_price", 0))
                 pe_ltp = safe_num((chain or {}).get("pe", {}).get("last_price", 0))
-                if ce_ltp > 0 and pe_ltp > 0:
-                    parity[K] = abs(ce_ltp - pe_ltp)
-            if parity:
-                spot = float(min(parity, key=parity.get))
+                if ce_ltp > 0 and pe_ltp > 0 and K > 0:
+                    # put-call parity: C - P = S - K*exp(-rT) ≈ S - K for short T
+                    # → S ≈ C - P + K
+                    spot_estimates.append(ce_ltp - pe_ltp + K)
+            if spot_estimates:
+                # Use median to be robust against wide-spread / illiquid strikes
+                spot = float(np.median(spot_estimates))
         except Exception:
             pass
 
@@ -531,6 +773,17 @@ def fetch_dhan_option_chain(expiry=None):
         pass
 
     return df, spot, expiry
+
+
+# CI #8 fix: cached wrapper around fetch_dhan_option_chain for callers that
+# fetch the BACK expiry every 60s visitor refresh (e.g., the v4 #6 Inter-Expiry
+# Roll Signal at ~L4630). The bare function has no caching — every visitor
+# triggered a fresh Dhan POST, violating the ~1-req/3s rate limit and doubling
+# API spend. 5-min TTL is sufficient because roll-detection doesn't need
+# per-minute granularity.
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_dhan_option_chain_cached(expiry=None):
+    return fetch_dhan_option_chain(expiry)
 
 
 def fetch_demo_option_chain():
@@ -584,10 +837,30 @@ def fetch_demo_option_chain():
 
 
 def get_option_chain(expiry=None):
+    """CI #10 fix: distinguish "API error" from "no credentials / demo mode".
+
+    Previously: any transient Dhan failure (timeout, 429, 5xx) returned an empty
+    DataFrame, which silently triggered `fetch_demo_option_chain` and was labeled
+    "DEMO MODE (No API credentials)". Users saw fabricated spot/OI/IV values
+    presented as if their credentials were missing — a data-integrity / trust
+    issue.
+
+    Now: returns one of three source strings:
+      - " LIVE — Dhan API"           : successful live fetch
+      - " API ERROR — using stale demo data"  : live fetch failed, fell back to demo
+                                                (clearly labeled as NOT real data)
+      - " DEMO MODE (No API credentials)"     : USE_DHAN is False (genuine demo)
+    """
     if USE_DHAN:
         df, spot, exp = fetch_dhan_option_chain(expiry)
         if not df.empty:
-            return df, spot, exp, " LIVE  Dhan API"
+            return df, spot, exp, " LIVE — Dhan API"
+        # Live fetch returned empty — this is an API ERROR, not "no credentials".
+        # Fall back to demo data (so the dashboard remains visually populated)
+        # but tag the source so the banner can surface a clear warning.
+        df, spot, exp = fetch_demo_option_chain()
+        return df, spot, exp, " API ERROR — using stale demo data"
+    # USE_DHAN is False — genuine demo mode (no credentials configured)
     df, spot, exp = fetch_demo_option_chain()
     return df, spot, exp, " DEMO MODE (No API credentials)"
 
@@ -603,14 +876,18 @@ def _load_dhan_instrument_master():
         if _fut_master_df is not None:
             return _fut_master_df
         try:
-            import requests, io
-            resp = requests.get("https://images.dhan.co/api-data/api-scrip-master.csv", timeout=25)
-            resp.raise_for_status()
-            df = pd.read_csv(io.StringIO(resp.text), low_memory=False)
+            import io
+            # H1+H3 fix: use the shared session (with retry/backoff) via _dhan_get_csv.
+            csv_text = _dhan_get_csv("https://images.dhan.co/api-data/api-scrip-master.csv", timeout=25)
+            df = pd.read_csv(io.StringIO(csv_text), low_memory=False)
             df.columns = [c.strip().upper() for c in df.columns]
             _fut_master_df = df
             return _fut_master_df
-        except Exception:
+        except (DhanAPIError, Exception) as e:
+            try:
+                print(f"[_load_dhan_instrument_master] error: {e}", flush=True)
+            except Exception:
+                pass
             return None
 
 def _resolve_futures_id(near_expiry_str=None):
@@ -650,7 +927,6 @@ _fut_ltp_cache = {"ltp": 0.0, "ts": 0.0}
 _FUT_CACHE_SEC = 58
 
 def fetch_futures_ltp(near_expiry_str=None):
-    import requests
     if not USE_DHAN:
         return 0.0
     now = time.time()
@@ -663,17 +939,14 @@ def fetch_futures_ltp(near_expiry_str=None):
             return 0.0
         _fut_id_cache["NIFTY"] = {"id": sec_id, "expiry": exp_dt}
         cached = _fut_id_cache["NIFTY"]
-    headers = {
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id": str(DHAN_CLIENT_ID),
-        "Content-Type": "application/json",
-    }
     try:
-        resp  = requests.post(
+        # H1+H2+H3 fix: route through shared _dhan_post helper (status check,
+        # status=="success" validation, retry+backoff).
+        rjson = _dhan_post(
             "https://api.dhan.co/v2/marketfeed/ltp",
-            headers=headers, json={"NSE_FNO": [int(cached["id"])]}, timeout=8,
+            {"NSE_FNO": [int(cached["id"])]},
+            timeout=8,
         )
-        rjson = resp.json()
         seg = (rjson.get("data") or {}).get("NSE_FNO") or {}
         for _, info in seg.items():
             ltp = float(info.get("last_price") or info.get("ltp") or 0)
@@ -681,8 +954,11 @@ def fetch_futures_ltp(near_expiry_str=None):
                 _fut_ltp_cache["ltp"] = ltp
                 _fut_ltp_cache["ts"]  = now
                 return ltp
-    except Exception:
-        pass
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_futures_ltp] error: {e}", flush=True)
+        except Exception:
+            pass
     return _fut_ltp_cache.get("ltp", 0.0)
 
 
@@ -713,7 +989,7 @@ def compute_max_pain(df):
     return float(min(results, key=results.get)) if results else 0.0
 
 
-def compute_metrics(df, spot, expiry=None):
+def compute_metrics(df, spot, expiry=None, history=None):
     if df.empty:
         return {}
 
@@ -737,6 +1013,14 @@ def compute_metrics(df, spot, expiry=None):
     net_theta = float((t["call_oi"] * t["call_theta"]).sum() + (t["put_oi"] * t["put_theta"]).sum())
     momentum  = float((t["call_oi_chg"] * t["call_delta"]).sum() + (t["put_oi_chg"] * t["put_delta"]).sum())
 
+    # H10 fix: these are NOT textbook vanna / vega-skew — they are OI-weighted
+    # vega·delta triple product and OI-weighted call-vs-put vega ratio.
+    # Renaming the dict keys would touch many downstream consumers; we keep
+    # the keys for backward compatibility but document the true semantics here.
+    #   vanna      = OI-weighted vega·delta triple product / spot
+    #                (sign tracks call-vega-dominant vs put-vega-dominant)
+    #   vega_skew  = OI-weighted call-vega / put-vega ratio (NOT IV skew;
+    #                the actual IV skew is `skew_slope` computed elsewhere)
     vanna = float(
         ((t["call_oi"] * t["call_vega"] * t["call_delta"]).sum() +
          (t["put_oi"] * t["put_vega"] * t["put_delta"]).sum()) / max(spot, 1)
@@ -795,6 +1079,21 @@ def compute_metrics(df, spot, expiry=None):
     except Exception:
         pass
 
+    # ── CI #2 fix: override cross-sectional iv_rank with TEMPORAL iv_rank
+    # when sufficient history is available. The cross-sectional value is a
+    # smile-position metric (close to 0 for normal NIFTY smiles where ATM sits
+    # near the IV min), which makes the HIGH_VOL / LOW_VOL regime classifier
+    # and the IV-rank-driven strategy branches (Iron Condor ≥65 / Iron Fly ≤35)
+    # systematically misfire. The temporal rank uses a trailing ~20-day window
+    # of ATM IV from `nifty_history.json`.
+    _smile_position = iv_rank  # preserve original for diagnostics
+    _iv_rank_is_temporal = False
+    if history and atm_iv > 0:
+        _temp_ivr, _is_ok = compute_temporal_iv_rank(atm_iv, history)
+        if _is_ok and _temp_ivr is not None:
+            iv_rank = _temp_ivr
+            _iv_rank_is_temporal = True
+
     # Structural features
     step = NIFTY_STEP
     support    = float(wide_df.loc[wide_df["put_oi"].idxmax(), "strike"])
@@ -835,6 +1134,8 @@ def compute_metrics(df, spot, expiry=None):
         "gamma_flip": round(gamma_flip, 0) if gamma_flip is not None else None,
         "iv_rank": iv_rank,
         "iv_pct": iv_pct,
+        "iv_rank_is_temporal": _iv_rank_is_temporal,   # CI #2 fix
+        "smile_position": _smile_position,             # CI #2 fix (diagnostic)
         "vanna": round(vanna, 2),
         "gt_ratio": round(gt_ratio, 4),
         "momentum": round(momentum, 0),
@@ -918,6 +1219,14 @@ def classify_iv_smile_scenario(df_band, m, spot, iv_smile_history=None):
             w_d_put  += wt * (safe_num(h_next.get("put_wing_excess", 0)) - safe_num(h.get("put_wing_excess", 0)))
             w_d_call += wt * (safe_num(h_next.get("call_wing_excess", 0)) - safe_num(h.get("call_wing_excess", 0)))
         peak_atm = max(r.get("atm_iv", 0) for r in iv_smile_history)
+        # CI #9 fix: previously a SECOND `trend_info = {...}` assignment here
+        # silently overwrote this richer weighted dict, discarding
+        # `weighted_d_atm/put/call` and `lookback`. The weighted computation ran
+        # every tick and was thrown away. We now keep the weighted version and
+        # surface all fields. Downstream consumers (_sc closure + Scenario 8
+        # check at L1130) only read `has_trend` and `peak_atm_iv`, which both
+        # versions provided — so this fix preserves behavior while exposing
+        # the weighted fields for future scenario rules.
         trend_info = {
             "has_trend":      True,
             "d_atm_iv":       round(d_atm, 2),
@@ -929,14 +1238,6 @@ def classify_iv_smile_scenario(df_band, m, spot, iv_smile_history=None):
             "weighted_d_put":  round(w_d_put, 2),
             "weighted_d_call": round(w_d_call, 2),
             "lookback":       lookback,
-        }
-        trend_info = {
-            "has_trend":   True,
-            "d_atm_iv":    round(d_atm,  2),
-            "d_put_wing":  round(d_put,  2),
-            "d_call_wing": round(d_call, 2),
-            "peak_atm_iv": round(peak_atm, 2),
-            "ticks":       len(iv_smile_history),
         }
 
     def _sc(sid, name, badge, bc, signals, strategies, confidence, description):
@@ -1700,7 +2001,11 @@ def compute_pre_move_alert(m, history):
         wall_width = safe_num(m.get("wall_width", 400))
         _step = max(wall_width / 20, 50)
         proximity_threshold = max(2.0 * _step, 100)
-        if (0 <= gex < 1000 or gex < 0) and flip_distance < proximity_threshold:
+        # H11 fix: original `(0 <= gex < 1000 or gex < 0)` simplifies to `gex < 1000`
+        # (the `or gex < 0` clause is dead since 0<=gex<1000 already covers the
+        # 0..1000 range and `gex < 0` covers everything below 0). Intent appears to
+        # be "small positive GEX [0,1000) OR any negative GEX" → `gex < 1000`.
+        if gex < 1000 and flip_distance < proximity_threshold:
             fires.append("GEX FLIP RISK")
             side_note = "below flip" if atm < gamma_flip else "above flip"
             details.append(f"GEX={'positive' if gex>=0 else 'NEGATIVE'} ({gex:,.0f}), spot {flip_distance:.0f}pts from flip @ {int(gamma_flip)} [{side_note}]")
@@ -1977,7 +2282,10 @@ def compute_synthetic_future(df_band, spot, atm, expiry_str, r=0.065):
                 continue
     except Exception:
         pass
-    fair_future  = spot * (1 + r * T)
+    fair_future  = spot * np.exp(r * T)   # H9 fix: was spot*(1+r*T) (simple interest);
+                                           # the synthetic call-put+K is a continuous-compounding
+                                           # forward per BS assumptions. Mismatch was numerically
+                                           # tiny for short DTE but methodologically inconsistent.
     fair_basis   = fair_future - spot
     synth_basis  = synthetic  - spot
     synth_excess = synthetic  - fair_future
@@ -2060,22 +2368,16 @@ def fetch_nifty_intraday_candles():
     """
     if not USE_DHAN:
         return []
-    import requests
     # Resolve near-month NIFTY futures security ID (reuses existing helper)
     _fut_sec_id, _fut_expiry = _resolve_futures_id()
     if not _fut_sec_id:
         return []
     today_str = date.today().strftime("%Y-%m-%d")
-    headers = {
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id":    str(DHAN_CLIENT_ID),
-        "Content-Type": "application/json",
-    }
     try:
-        resp = requests.post(
+        # H1+H2+H3 fix: shared helper — status check, success validation, retry/backoff.
+        data = _dhan_post(
             "https://api.dhan.co/v2/charts/intraday",
-            headers=headers,
-            json={
+            {
                 "securityId":      str(_fut_sec_id),
                 "exchangeSegment": "NSE_FNO",
                 "instrument":      "FUTIDX",
@@ -2086,7 +2388,6 @@ def fetch_nifty_intraday_candles():
             },
             timeout=15,
         )
-        data = resp.json()
         ts_arr  = data.get("timestamp", [])
         op_arr  = data.get("open",      [])
         hi_arr  = data.get("high",      [])
@@ -2095,18 +2396,35 @@ def fetch_nifty_intraday_candles():
         vo_arr  = data.get("volume",    [])
         if not ts_arr:
             return []
+        # M7 fix: validate array lengths — partial responses were silently zero-filled,
+        # producing fake 0-volume / 0-price candles that corrupt VWAP & Opening Range.
+        n = len(ts_arr)
+        for arr_name, arr in (("open", op_arr), ("high", hi_arr),
+                              ("low", lo_arr), ("close", cl_arr),
+                              ("volume", vo_arr)):
+            if len(arr) != n:
+                try:
+                    print(f"[fetch_nifty_intraday_candles] array length mismatch: "
+                          f"ts={n} {arr_name}={len(arr)} — discarding response", flush=True)
+                except Exception:
+                    pass
+                return []
         candles = []
         for i, ts in enumerate(ts_arr):
             candles.append({
                 "ts":     int(ts),
-                "open":   float(op_arr[i]) if i < len(op_arr) else 0.0,
-                "high":   float(hi_arr[i]) if i < len(hi_arr) else 0.0,
-                "low":    float(lo_arr[i]) if i < len(lo_arr) else 0.0,
-                "close":  float(cl_arr[i]) if i < len(cl_arr) else 0.0,
-                "volume": float(vo_arr[i]) if i < len(vo_arr) else 0.0,
+                "open":   float(op_arr[i]),
+                "high":   float(hi_arr[i]),
+                "low":    float(lo_arr[i]),
+                "close":  float(cl_arr[i]),
+                "volume": float(vo_arr[i]),
             })
         return candles
-    except Exception:
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_nifty_intraday_candles] error: {e}", flush=True)
+        except Exception:
+            pass
         return []
 
 
@@ -2188,22 +2506,16 @@ def fetch_back_expiry_atm_iv(back_expiry: str):
     """
     if not USE_DHAN or not back_expiry:
         return None
-    import requests
-    headers = {
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id":    str(DHAN_CLIENT_ID),
-        "Content-Type": "application/json",
-    }
     sec = DHAN_SECURITY["NIFTY"]
     try:
-        resp = requests.post(
+        # H1+H2+H3 fix: shared helper.
+        resp = _dhan_post(
             "https://api.dhan.co/v2/optionchain",
-            headers=headers,
-            json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
-                  "Expiry": back_expiry},
+            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
+             "Expiry": back_expiry},
             timeout=15,
         )
-        data = resp.json().get("data", {}) or {}
+        data = resp.get("data", {}) or {}
         spot = float(data.get("last_price") or data.get("ltp") or 0)
         oc   = data.get("oc", {}) or {}
         if spot <= 0 or not oc:
@@ -2224,7 +2536,11 @@ def fetch_back_expiry_atm_iv(back_expiry: str):
         elif pe_iv > 0.5:
             atm_iv_back = pe_iv
         return round(atm_iv_back, 2) if atm_iv_back > 0 else None
-    except Exception:
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_back_expiry_atm_iv] error: {e}", flush=True)
+        except Exception:
+            pass
         return None
 
 
@@ -2240,25 +2556,25 @@ def fetch_back_expiry_oi_band(back_expiry: str):
     """
     if not USE_DHAN or not back_expiry:
         return pd.DataFrame()
-    import requests
-    headers = {
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id":    str(DHAN_CLIENT_ID),
-        "Content-Type": "application/json",
-    }
     sec = DHAN_SECURITY["NIFTY"]
     try:
-        resp = requests.post(
+        # H1+H2+H3 fix: shared helper.
+        resp = _dhan_post(
             "https://api.dhan.co/v2/optionchain",
-            headers=headers,
-            json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
-                  "Expiry": back_expiry},
+            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
+             "Expiry": back_expiry},
             timeout=15,
         )
-        data = resp.json().get("data", {}) or {}
+        data = resp.get("data", {}) or {}
         oc   = data.get("oc", {}) or {}
         if not oc:
             return pd.DataFrame()
+        # H6 fix: use int(float(...)) for OI parsing
+        def _safe_int(v):
+            try:
+                return int(float(v or 0))
+            except (TypeError, ValueError):
+                return 0
         rows = []
         for strike_str, chain in oc.items():
             K  = safe_num(strike_str, 0)
@@ -2266,10 +2582,10 @@ def fetch_back_expiry_oi_band(back_expiry: str):
                 continue
             ce = (chain or {}).get("ce", {}) or {}
             pe = (chain or {}).get("pe", {}) or {}
-            c_oi      = int(ce.get("oi", 0) or 0)
-            c_prev_oi = int(ce.get("previous_oi", 0) or 0)
-            p_oi      = int(pe.get("oi", 0) or 0)
-            p_prev_oi = int(pe.get("previous_oi", 0) or 0)
+            c_oi      = _safe_int(ce.get("oi", 0))
+            c_prev_oi = _safe_int(ce.get("previous_oi", 0))
+            p_oi      = _safe_int(pe.get("oi", 0))
+            p_prev_oi = _safe_int(pe.get("previous_oi", 0))
             rows.append({
                 "strike":      K,
                 "call_oi":     c_oi,
@@ -2281,7 +2597,11 @@ def fetch_back_expiry_oi_band(back_expiry: str):
             return pd.DataFrame()
         df = pd.DataFrame(rows)
         return df.sort_values("strike").reset_index(drop=True)
-    except Exception:
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_back_expiry_oi_band] error: {e}", flush=True)
+        except Exception:
+            pass
         return pd.DataFrame()
 
 
@@ -2522,34 +2842,31 @@ def fetch_india_vix_ltp():
     """
     if not USE_DHAN:
         return 0.0
-    import requests
     now = time.time()
     if now - _vix_ltp_cache_v7["ts"] < _VIX_CACHE_SEC and _vix_ltp_cache_v7["ltp"] > 0:
         return _vix_ltp_cache_v7["ltp"]
     vix_id = _resolve_india_vix_id()
     if not vix_id:
         return 0.0
-    headers = {
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id":    str(DHAN_CLIENT_ID),
-        "Content-Type": "application/json",
-    }
     try:
-        resp  = requests.post(
+        # H1+H2+H3 fix: shared helper.
+        rjson = _dhan_post(
             "https://api.dhan.co/v2/marketfeed/ltp",
-            headers=headers,
-            json={"NSE_INDEX": [int(vix_id)]},
+            {"NSE_INDEX": [int(vix_id)]},
             timeout=8,
         )
-        seg = (resp.json().get("data") or {}).get("NSE_INDEX") or {}
+        seg = (rjson.get("data") or {}).get("NSE_INDEX") or {}
         for _, info in seg.items():
             ltp = float(info.get("last_price") or info.get("ltp") or 0)
             if ltp > 0:
                 _vix_ltp_cache_v7["ltp"] = ltp
                 _vix_ltp_cache_v7["ts"]  = now
                 return ltp
-    except Exception:
-        pass
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_india_vix_ltp] error: {e}", flush=True)
+        except Exception:
+            pass
     return _vix_ltp_cache_v7.get("ltp", 0.0)
 
 
@@ -3193,14 +3510,35 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
     enhanced_score = round(max(-100.0, min(100.0, raw_score)), 1)
 
     # Signal agreement for confidence
-    signs = []
-    if s34_score != 0:   signs.append(1 if s34_score > 0 else -1)
-    if price_s   != 0:   signs.append(1 if price_s   > 0 else -1)
-    if ts_s      != 0:   signs.append(1 if ts_s      > 0 else -1)
-    if vix_s     != 0:   signs.append(1 if vix_s     > 0 else -1)
-    agree_count = sum(1 for s in signs if s == (1 if enhanced_score >= 0 else -1))
-    n_signals   = max(len(signs), 1)
-    agreement_pct = agree_count / n_signals
+    # H14 fix: agreement_pct was previously measured against the SIGN of
+    # `enhanced_score` itself — which is dominated by s34 (weight w_s34=50).
+    # The score and its confidence were circularly derived from the same inputs:
+    # a strongly-weighted s34 component would dominate the score sign, then
+    # agreement_pct would mechanically read ~1.0 (since s34's sign matches the
+    # score sign). Confidence became a function of s34 weight, not of genuine
+    # cross-signal corroboration.
+    # Fix: measure agreement against s34's sign (the dominant input), not the
+    # output score. Non-s34 signals (price/ts/vix) that agree with s34 boost
+    # confidence; non-s34 signals that disagree pull it down. s34 itself is
+    # excluded from the agreement count so the metric reflects corroboration
+    # FROM the other signals, not self-agreement.
+    signs_non_s34 = []
+    if price_s   != 0:   signs_non_s34.append(1 if price_s   > 0 else -1)
+    if ts_s      != 0:   signs_non_s34.append(1 if ts_s      > 0 else -1)
+    if vix_s     != 0:   signs_non_s34.append(1 if vix_s     > 0 else -1)
+    s34_sign = 1 if s34_score > 0 else (-1 if s34_score < 0 else 0)
+    if s34_sign != 0 and signs_non_s34:
+        agree_count = sum(1 for s in signs_non_s34 if s == s34_sign)
+        agreement_pct = agree_count / len(signs_non_s34)
+    else:
+        # s34 is zero or no other signals available — fall back to old formula
+        signs = []
+        if s34_score != 0:   signs.append(1 if s34_score > 0 else -1)
+        if price_s   != 0:   signs.append(1 if price_s   > 0 else -1)
+        if ts_s      != 0:   signs.append(1 if ts_s      > 0 else -1)
+        if vix_s     != 0:   signs.append(1 if vix_s     > 0 else -1)
+        agree_count = sum(1 for s in signs if s == (1 if enhanced_score >= 0 else -1))
+        agreement_pct = agree_count / max(len(signs), 1)
 
     base_confidence = min(abs(enhanced_score), 100)
     conf_bonus      = agreement_pct * 20.0   # up to +20 when all agree
@@ -3266,16 +3604,25 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
 # ─── Fetch + compute ──────────────────────────────────────────────────────────
 # Server-side cache: shared across ALL visitor sessions in the same process.
 # Visitors only read from this cache; only the timed expiry triggers a new API call.
-_srv_cache_lock   = threading.Lock()
-_srv_cache        = {"payload": None, "source": None, "last_fetch_ts": 0.0}
+#
+# CI #7 fix: separate "fetch in progress" flag from the cache itself so concurrent
+# visitors don't serialize on the network call. Pattern:
+#   - Acquire lock briefly. If cache fresh → return cached payload.
+#   - If cache stale AND no fetch in progress → set fetch_in_progress=True,
+#     release lock, do the fetch, re-acquire lock, store payload, clear flag.
+#   - If cache stale AND fetch already in progress → return stale payload
+#     (stale-while-revalidate).
+_srv_cache_lock      = threading.Lock()
+_srv_cache           = {"payload": None, "source": None, "last_fetch_ts": 0.0}
+_srv_fetch_in_progress = False     # CI #7 fix: single-flight flag
 
-def _raw_fetch_and_compute(expiry_override=None):
+def _raw_fetch_and_compute(expiry_override=None, history=None):
     """Actual Dhan API fetch — never called directly by visitors."""
     df, spot, expiry, source = get_option_chain(expiry_override)
     if df.empty:
         return None, source
 
-    m = compute_metrics(df, spot, expiry)
+    m = compute_metrics(df, spot, expiry, history=history)
     if not m:
         return None, source
 
@@ -3317,33 +3664,96 @@ def get_server_data(expiry_override=None):
     Visitor page-refreshes (every 60 s) NEVER trigger a new API call.
     last_fetch_ts is the Unix timestamp of the most recent Dhan fetch — used by
     callers to dedup history entries so one data snapshot → exactly one entry.
+
+    CI #7 fix: single-flight refresh — the lock is held only for the cache
+    check, NOT during the network call. Concurrent visitors return the stale
+    payload while one thread refreshes (stale-while-revalidate).
     """
-    global _srv_cache
+    global _srv_cache, _srv_fetch_in_progress
     settings = _load_owner_settings()
     interval = settings.get("refresh_interval", REFRESH_SECONDS)
     expiry_to_use = expiry_override or settings.get("selected_expiry")
 
+    # ── Phase 1: brief lock to check cache freshness ──
     with _srv_cache_lock:
         now = time.time()
         cache_expired = (now - _srv_cache["last_fetch_ts"]) >= interval
-        if _srv_cache["payload"] is None or cache_expired:
-            payload, source = _raw_fetch_and_compute(expiry_to_use)
-            if payload is not None:
-                _srv_cache["payload"] = payload
-                _srv_cache["source"]  = source
-                _srv_cache["last_fetch_ts"] = now
-        return (
-            _srv_cache.get("payload"),
-            _srv_cache.get("source", "N/A"),
-            _srv_cache.get("last_fetch_ts", 0.0),
-        )
+        if not cache_expired and _srv_cache["payload"] is not None:
+            # Cache fresh — return immediately
+            return (
+                _srv_cache.get("payload"),
+                _srv_cache.get("source", "N/A"),
+                _srv_cache.get("last_fetch_ts", 0.0),
+            )
+        # Cache stale — check if another thread is already fetching
+        if _srv_fetch_in_progress:
+            # Stale-while-revalidate: return what we have, let the other thread finish
+            return (
+                _srv_cache.get("payload"),
+                _srv_cache.get("source", "N/A"),
+                _srv_cache.get("last_fetch_ts", 0.0),
+            )
+        # Claim the fetch slot
+        _srv_fetch_in_progress = True
+
+    # ── Phase 2: do the network call WITHOUT holding the lock ──
+    try:
+        _hist_for_ivr = _load_history()
+        payload, source = _raw_fetch_and_compute(expiry_to_use, history=_hist_for_ivr)
+    except Exception:
+        payload, source = None, "API ERROR"
+
+    # ── Phase 3: re-acquire lock to update cache + clear flag ──
+    with _srv_cache_lock:
+        _srv_fetch_in_progress = False
+        if payload is not None:
+            _srv_cache["payload"] = payload
+            _srv_cache["source"]  = source
+            _srv_cache["last_fetch_ts"] = time.time()
+        # If payload is None (fetch failed), keep the previous stale payload
+        # but bump last_fetch_ts by a short cooldown to prevent retry storms.
+        # CI #4 / H7 fix: was 0.0 → every subsequent visitor retried the failed
+        # fetch with no backoff.
+        elif _srv_cache["payload"] is not None:
+            _srv_cache["last_fetch_ts"] = time.time() - max(0, interval - 30)  # 30s cooldown
+
+    return (
+        _srv_cache.get("payload"),
+        _srv_cache.get("source", "N/A"),
+        _srv_cache.get("last_fetch_ts", 0.0),
+    )
 
 
 def _force_server_refresh(expiry_override=None):
-    """Owner-only: clear server cache to force the next get_server_data() call to fetch fresh data."""
+    """Owner-only: clear ALL caches so the next get_server_data() fetches fresh data.
+
+    CI #4 fix: previously only zeroed `_srv_cache["last_fetch_ts"]`. That left
+    three Streamlit-cached fetchers (intraday candles, back-expiry OI band,
+    back-expiry ATM IV) and two module-level LTP caches serving stale data for
+    their full TTLs. The owner clicked "Refresh Now" and saw a partially stale
+    dashboard. Now we clear everything explicitly.
+    """
     global _srv_cache
     with _srv_cache_lock:
         _srv_cache["last_fetch_ts"] = 0.0   # expire the cache immediately
+
+    # CI #4 fix: clear Streamlit's @st.cache_data layer
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+    # CI #4 fix: clear module-level LTP caches (futures + VIX)
+    # These are read by `fetch_futures_ltp` / `fetch_india_vix_ltp` and were
+    # previously left serving stale values for ~60s after a manual refresh.
+    try:
+        _fut_ltp_cache["ts"] = 0.0
+    except Exception:
+        pass
+    try:
+        _vix_ltp_cache_v7["ts"] = 0.0
+    except Exception:
+        pass
 
 
 # ─── OI Velocity bucket helpers ───────────────────────────────────────────────
@@ -3844,6 +4254,16 @@ def compute_eod_erosion(df, spot, atm_iv, expiry_str):
     else:
         elapsed = (now - open_).total_seconds() / 3600.0
         frac = max(0.0, (SESSION_HRS - elapsed) / SESSION_HRS)
+    # H12 fix: `_bs_greeks` returns theta per CALENDAR day (/365). The previous
+    # code multiplied theta by `frac` = (session_hours_remaining / 6.25), treating
+    # the trading session as a calendar day and overestimating intraday decay by
+    # ~24/6.25 ≈ 3.84×. The correct scaling is calendar-day-correct:
+    #   theta_per_session_remaining = theta * (session_hours_remaining / 24)
+    # We keep `frac` for the "fraction of session remaining" label/anchor but use
+    # `frac_calendar` for the actual theta scaling. (Note: this makes EOD erosion
+    # projections less aggressive — for expiry-day acceleration, see the
+    # iv_crush_frac component, which is separately tuned.)
+    frac_calendar = frac * (SESSION_HRS / 24.0)
     try:
         exp_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
         cal_days = max((exp_date - datetime.now().date()).days, 0)
@@ -3869,7 +4289,7 @@ def compute_eod_erosion(df, spot, atm_iv, expiry_str):
             if ltp <= 0.50:
                 continue
             delta_iv_pp   = iv * iv_crush_frac
-            theta_component = theta * frac
+            theta_component = theta * frac_calendar   # H12 fix: was `theta * frac` (3.84× over-estimated)
             scenario_erosions = {}
             for scen_name, pct_move in _SCENARIOS.items():
                 dS = spot * pct_move
@@ -3927,7 +4347,7 @@ def compute_eod_erosion(df, spot, atm_iv, expiry_str):
                    "Base Erosion %":base_erosion,
                    "Erosion Range":f"{erosion_min}%  {erosion_max}%",
                    "Robust (of 5)":robust_count,
-                   "Θ Decay (₹)":round(abs(theta*frac),2),
+                   "Θ Decay (₹)":round(abs(theta*frac_calendar),2),  # H12 fix: was theta*frac
                    "ν·ΔIV (₹)":round(vega*delta_iv_pp,2),
                    "Delta":round(delta,3),"IV %":round(iv,1),
                    "OI":int(oi),"OI Chg":int(oi_chg),
@@ -3948,72 +4368,147 @@ _SETTINGS_FILE      = os.path.join(_BASE_DIR, "nifty_settings.json")
 _BIAS_HISTORY_FILE  = os.path.join(_BASE_DIR, "nifty_bias_history.json")
 _SMILE_HISTORY_FILE = os.path.join(_BASE_DIR, "nifty_smile_history.json")
 
+# CI #6 fix: single process-wide lock for ALL persistent-state writes.
+# Prevents concurrent visitor sessions from corrupting the JSON files via
+# interleaved read-modify-write cycles (which the previous bare `open(w)` calls
+# allowed — last writer wins, file can be truncated if process is killed mid-write).
+_persist_lock = threading.Lock()
+
+# H25 fix: TTL cache for _load_owner_settings. The function was being called
+# 2-3× per rerun from multiple sites (sidebar, get_server_data, banner) and
+# each call did an `open + json.load`. With N visitors refreshing every 60s,
+# that's 2-3N disk reads/minute for a file that changes only when the owner
+# toggles a setting. 5s TTL coalesces reads within a single rerun.
+_owner_settings_cache = {"data": None, "ts": 0.0}
+_OWNER_SETTINGS_TTL = 5.0   # seconds
+
+# H26 fix: mtime check for _load_bias_history. The function reads the entire
+# JSON file from disk every rerun (60s) per visitor for cross-visitor dedup.
+# With mtime check, we only re-read when the file actually changed.
+_bias_history_cache = {"data": None, "mtime": -1.0}
+
+
+def _atomic_json_write(path, obj):
+    """CI #6 fix: atomic JSON write via write-temp-then-os.replace.
+
+    - Writes to `<path>.tmp` first, then atomically renames to `<path>` via
+      os.replace (POSIX atomicity guarantee).
+    - Refuses to write NaN/Infinity (allow_nan=False) so the file stays
+      RFC-8259 compliant and parseable by non-Python tools.
+    - Caller must already hold _persist_lock if cross-file atomicity matters.
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f, allow_nan=False)
+        os.replace(tmp, path)   # atomic on POSIX
+    except (TypeError, ValueError) as e:
+        # NaN/Infinity in obj — refuse to corrupt the file
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        # Re-raise so the caller's `except Exception: pass` logs nothing,
+        # but the existing file on disk is preserved.
+        raise
+
+
 # ── Main tick history ─────────────────────────────────────────────────────────
 def _load_history():
     """Load history from disk on fresh session start."""
-    try:
-        with open(_HISTORY_FILE, "r") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data[-500:]
-    except Exception:
-        pass
+    with _persist_lock:
+        try:
+            with open(_HISTORY_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data[-500:]
+        except Exception:
+            pass
     return []
 
 def _save_history(history):
     """Persist history to disk after every new tick."""
-    try:
-        with open(_HISTORY_FILE, "w") as f:
-            json.dump(history[-500:], f)
-    except Exception:
-        pass
+    with _persist_lock:
+        try:
+            _atomic_json_write(_HISTORY_FILE, history[-500:])
+        except Exception:
+            pass
 
 # ── Owner settings (refresh interval, selected expiry) ───────────────────────
 def _load_owner_settings():
-    try:
-        with open(_SETTINGS_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {"refresh_interval": REFRESH_SECONDS, "selected_expiry": None}
+    # H25 fix: TTL cache — coalesce multiple calls within 5 seconds.
+    now = time.time()
+    if (_owner_settings_cache["data"] is not None and
+        now - _owner_settings_cache["ts"] < _OWNER_SETTINGS_TTL):
+        return _owner_settings_cache["data"]
+    with _persist_lock:
+        try:
+            with open(_SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {"refresh_interval": REFRESH_SECONDS, "selected_expiry": None}
+    _owner_settings_cache["data"] = data
+    _owner_settings_cache["ts"]   = now
+    return data
 
 def _save_owner_settings(settings):
-    try:
-        with open(_SETTINGS_FILE, "w") as f:
-            json.dump(settings, f)
-    except Exception:
-        pass
+    with _persist_lock:
+        try:
+            _atomic_json_write(_SETTINGS_FILE, settings)
+        except Exception:
+            pass
+    # H25 fix: invalidate the TTL cache so the next read picks up the new value
+    _owner_settings_cache["data"] = None
+    _owner_settings_cache["ts"]   = 0.0
 
 # ── S3/4 Bias chart history (persisted so mid-session joiners see full chart) ─
 def _load_bias_history():
+    # H26 fix: mtime check — only re-read when the file actually changed.
+    # Was reading the entire JSON every rerun per visitor for cross-visitor dedup.
     try:
-        with open(_BIAS_HISTORY_FILE, "r") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except Exception:
-        return []
+        current_mtime = os.path.getmtime(_BIAS_HISTORY_FILE)
+    except OSError:
+        current_mtime = -1.0
+    # Cache hit if mtime is unchanged AND we have data (or both are -1 = file missing)
+    if current_mtime == _bias_history_cache["mtime"]:
+        return _bias_history_cache["data"] if _bias_history_cache["data"] is not None else []
+    with _persist_lock:
+        try:
+            with open(_BIAS_HISTORY_FILE, "r") as f:
+                data = json.load(f)
+                data = data if isinstance(data, list) else []
+        except Exception:
+            data = []
+    _bias_history_cache["data"]  = data
+    _bias_history_cache["mtime"] = current_mtime
+    return data
 
 def _save_bias_history(bh):
-    try:
-        with open(_BIAS_HISTORY_FILE, "w") as f:
-            json.dump(bh[-60:], f)
-    except Exception:
-        pass
+    with _persist_lock:
+        try:
+            _atomic_json_write(_BIAS_HISTORY_FILE, bh[-60:])
+        except Exception:
+            pass
+    # H26 fix: invalidate mtime cache so next read picks up the new file
+    _bias_history_cache["data"]  = None
+    _bias_history_cache["mtime"] = -1.0
 
 # ── IV Smile history (persisted so mid-session joiners get trend context) ─────
 def _load_smile_history():
-    try:
-        with open(_SMILE_HISTORY_FILE, "r") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    with _persist_lock:
+        try:
+            with open(_SMILE_HISTORY_FILE, "r") as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
 
 def _save_smile_history(sh):
-    try:
-        with open(_SMILE_HISTORY_FILE, "w") as f:
-            json.dump(sh[-20:], f)
-    except Exception:
-        pass
+    with _persist_lock:
+        try:
+            _atomic_json_write(_SMILE_HISTORY_FILE, sh[-20:])
+        except Exception:
+            pass
 
 # ── Session state initialisation (loads server-side data for every new visitor) ─
 if "history" not in st.session_state:
@@ -4072,6 +4567,11 @@ div[data-testid="stMetric"] { background:#fff; border-radius:10px; padding:10px 
   div[data-testid="stMetric"] { padding:6px 8px; border-radius:8px; }
   .badge { font-size:10px; padding:2px 7px; }
   .js-plotly-plot .plotly .gtitle { font-size:10px !important; }
+  /* H22 fix: GRF + Combined Decision grids had no media query — 3-column / 2-column
+     layouts were squishing to ~120px each on 360px phones. Force single column. */
+  .grf-grid-3, .grf-grid-2 { grid-template-columns: 1fr !important; }
+  /* Inline div-based grids (style attribute) can't be targeted via CSS, but
+     st.columns-based layouts already collapse to single column automatically. */
 }
 [data-testid="stAppViewContainer"],
 [data-testid="block-container"] {
@@ -4119,39 +4619,59 @@ with col_h2:
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA STATUS BANNER
 # ─────────────────────────────────────────────────────────────────────────────
-def _data_status_banner(use_dhan, market_open, use_demo, refresh_secs):
-    """Colour-coded full-width banner showing exactly what data state the app is in."""
+def _data_status_banner(use_dhan, market_open, use_demo, refresh_secs, data_source=None):
+    """Colour-coded full-width banner showing exactly what data state the app is in.
+
+    CI #10 fix: added `data_source` param so the banner can distinguish a real
+    API ERROR (live mode that failed and fell back to demo) from a genuine
+    demo-mode (no credentials). Previously both showed the same DEMO banner,
+    masking transient API failures.
+    """
     _now = ist_str("%H:%M:%S IST  |  %a %d %b %Y")
 
-    if use_dhan and market_open:
-        # ── GREEN  live, everything working ──────────────────────────────────
+    # CI #10 fix: detect API-error fallback (live mode that failed over to demo)
+    _is_api_error = bool(data_source and "API ERROR" in data_source)
+
+    if _is_api_error:
+        # ── RED — live mode but API call failed; serving stale demo data ──────
+        bg, border = "#FEF2F2", "#DC2626"
+        dot = ""
+        headline = "API ERROR — showing fallback demo data"
+        detail   = ("Dhan API call failed (timeout, rate-limit, or auth issue) · "
+                    "Values shown are <strong>simulated</strong>, not real market data · "
+                    "Will auto-retry on next refresh")
+        label_bg, label_fg = "#DC2626", "#ffffff"
+        label_text = "● API ERROR"
+
+    elif use_dhan and market_open:
+        # ── GREEN — live, everything working ──────────────────────────────────
         bg, border, dot_color = "#ECFDF5", "#059669", "#059669"
         dot = ""
-        headline = "LIVE DATA  Calculations are LIVE"
+        headline = "LIVE DATA — Calculations are LIVE"
         detail   = (f"Sourced from <strong>Dhan API</strong> in real time · "
                     f"Auto-refresh every <strong>{refresh_secs}s</strong> · "
-                    f"Market hours: MonFri 09:1515:30 IST")
+                    f"Market hours: MonFri 09:1515:30 IST")
         label_bg, label_fg = "#059669", "#ffffff"
         label_text = "● LIVE"
 
     elif use_dhan and not market_open:
-        # ── AMBER  Dhan connected but market closed; data is stale ──────────
+        # ── AMBER — Dhan connected but market closed; data is stale ──────────
         n = now_ist()
         is_weekend = n.weekday() >= 5
-        reason = "Weekend" if is_weekend else "Market closed (09:1515:30 IST)"
+        reason = "Weekend" if is_weekend else "Market closed (09:1515:30 IST)"
         bg, border = "#FFFBEB", "#D97706"
         dot = ""
-        headline = f"STALE DATA  {reason}"
-        detail   = (f"Last snapshot from <strong>Dhan API</strong>  no new ticks until market reopens · "
+        headline = f"STALE DATA — {reason}"
+        detail   = (f"Last snapshot from <strong>Dhan API</strong> — no new ticks until market reopens · "
                     f"Auto-refresh every <strong>{refresh_secs}s</strong> to keep app alive")
         label_bg, label_fg = "#D97706", "#ffffff"
         label_text = "● STALE"
 
     else:
-        # ── YELLOW  demo / no credentials ────────────────────────────────────
+        # ── YELLOW — demo / no credentials ────────────────────────────────────
         bg, border = "#FEFCE8", "#CA8A04"
         dot = ""
-        headline = "DEMO MODE  Synthetic data only"
+        headline = "DEMO MODE — Synthetic data only"
         detail   = ("No Dhan API credentials configured · All values are <strong>simulated</strong> · "
                     "Add <code>DHAN_CLIENT_ID</code> and <code>DHAN_ACCESS_TOKEN</code> to Streamlit secrets for live data")
         label_bg, label_fg = "#CA8A04", "#ffffff"
@@ -4186,7 +4706,10 @@ def _data_status_banner(use_dhan, market_open, use_demo, refresh_secs):
     </div>
     """, unsafe_allow_html=True)
 
-_data_status_banner(USE_DHAN, mh, USE_DEMO_MODE, _effective_refresh)
+# CI #10 fix: the banner used to be rendered here, BEFORE `payload` was fetched.
+# That meant on the very first run (no payload yet) the API-ERROR branch could
+# never fire. The banner has been MOVED to after the fetch (L~4520) so it can
+# inspect `data_source` from the just-fetched payload.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OWNER SIDEBAR + CONTROLS
@@ -4219,8 +4742,24 @@ with st.container():
 # ─────────────────────────────────────────────────────────────────────────────
 # FETCH DATA
 # ─────────────────────────────────────────────────────────────────────────────
-with st.spinner("Fetching NIFTY option chain"):
+# H24 fix: previously `st.spinner(...)` wrapped get_server_data unconditionally,
+# causing a visible flicker every 60s even when the server cache was fresh
+# (returning in <1ms). Pre-check cache age first; only show spinner when a real
+# network fetch is about to happen.
+_settings_h24  = _load_owner_settings()
+_interval_h24  = _settings_h24.get("refresh_interval", REFRESH_SECONDS)
+_cache_age_h24 = time.time() - _srv_cache.get("last_fetch_ts", 0.0)
+_needs_fetch_h24 = (_cache_age_h24 >= _interval_h24) or (_srv_cache.get("payload") is None)
+
+if _needs_fetch_h24:
+    with st.spinner("Fetching NIFTY option chain"):
+        payload, data_source, _payload_fetch_ts = get_server_data(sel_expiry)
+else:
     payload, data_source, _payload_fetch_ts = get_server_data(sel_expiry)
+
+# CI #10 fix: render the data-status banner HERE (after fetch) so it can inspect
+# `data_source` and distinguish a real API ERROR from genuine DEMO MODE.
+_data_status_banner(USE_DHAN, mh, USE_DEMO_MODE, _effective_refresh, data_source=data_source)
 
 if payload is None:
     st.error("❌ Could not fetch option chain data. Please check your API credentials or try again.")
@@ -4513,7 +5052,11 @@ _inter_expiry_signal = None
 if len(_expiry_list) > 1 and USE_DHAN:
     try:
         _back_exp = _expiry_list[1]
-        _back_chain, _, _ = fetch_dhan_option_chain(_back_exp)
+        # CI #8 fix: use the cached wrapper so concurrent visitors don't each
+        # fire a fresh Dhan POST for the back expiry (was violating ~1-req/3s
+        # rate limit). 5-min TTL on the cached wrapper is sufficient because
+        # roll detection doesn't need per-minute granularity.
+        _back_chain, _, _ = fetch_dhan_option_chain_cached(_back_exp)
         if not _back_chain.empty:
             _back_m = compute_metrics(_back_chain, spot, _back_exp)
             if _back_m:
@@ -5214,7 +5757,7 @@ if len(_bh_data) >= 2:
             tickfont=dict(size=9, color=_B_CYAN),
         ),
     )
-    st.plotly_chart(_bf, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(_bf, width='stretch', config={"displayModeBar": False})  # H23 fix: was use_container_width=True
 elif len(_bh_data) == 1:
     st.caption("⏳ Chart will appear after the second 5-minute snapshot is recorded.")
 
@@ -5309,7 +5852,7 @@ if _gd_src is not None:
         xaxis=dict(title="Strike", tickfont=dict(size=9)),
         font=dict(color="#1A1A2E", size=11),
     )
-    st.plotly_chart(_gc1_fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(_gc1_fig, width='stretch', config={"displayModeBar": False})  # H23 fix: was use_container_width=True
 
     # ─────────────────────────────────────────────────────────────────────────
     # CHART 2 + ALERT CARD — Sub-D: Gamma Blast Proximity Detector
@@ -5441,7 +5984,7 @@ if _gd_src is not None:
             ),
             font=dict(color="#1A1A2E", size=11),
         )
-        st.plotly_chart(_gc2_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(_gc2_fig, width='stretch', config={"displayModeBar": False})  # H23 fix: was use_container_width=True
 
     with _gd_col2:
         # ── Blast alert card ─────────────────────────────────────────────────
@@ -6706,7 +7249,13 @@ if len(history) >= 2:
             st.plotly_chart(sf2, width='stretch', config={"displayModeBar": False})
 
         # ── Composite Δ-Flow Bias + Gamma Blast Monitor side by side ────────
-        bias = compute_dw_composite_bias(bkt, expiry)
+        # H19 fix: was `bias = ...` which shadowed the module-level `bias`
+        # (compute_nifty_bias) used elsewhere. The two dicts have different
+        # schemas (legacy has factors/regime/confidence; DW has components/
+        # narrative/delta_active). Renamed to `dw_bias` so any code after this
+        # block that reads `bias["bias_score"]` etc. correctly gets the legacy
+        # nifty-bias values, not the DW composite.
+        dw_bias = compute_dw_composite_bias(bkt, expiry)
 
         # Compute gamma blast monitor
         _alert_for_gbm = compute_pre_move_alert(m, history)
@@ -6715,12 +7264,12 @@ if len(history) >= 2:
         bias_col, blast_col = st.columns(2)
 
         with bias_col:
-            b_score  = bias.get("score", 0)
-            b_dir    = bias.get("direction", "NEUTRAL")
-            b_conf   = bias.get("confidence", 0)
-            b_comps  = bias.get("components", {})
-            b_narr   = bias.get("narrative", "")
-            b_dact   = bias.get("delta_active", False)
+            b_score  = dw_bias.get("score", 0)
+            b_dir    = dw_bias.get("direction", "NEUTRAL")
+            b_conf   = dw_bias.get("confidence", 0)
+            b_comps  = dw_bias.get("components", {})
+            b_narr   = dw_bias.get("narrative", "")
+            b_dact   = dw_bias.get("delta_active", False)
 
             if b_score >= 45:    b_col = "#059669"
             elif b_score >= 15:  b_col = "#10B981"
@@ -7002,7 +7551,10 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ─── Auto-refresh (Streamlit Community Cloud — triggers rerun, preserves session state) ───
+# ─── Auto-refresh note ─────────────────────────────────────────────────────────
+# CI #5 fix: st_autorefresh was previously registered here at the end of the
+# script. It has been moved to the top (right after set_page_config) so it
+# survives any st.stop() triggered by API failures. See L75 for the actual call.
 # Page always refreshes every 60 s for ALL visitors.
-# Data refresh cadence is governed by the server-side interval set in owner mode — independent of this.
-st_autorefresh(interval=60_000, key="nifty_autorefresh")
+# Data refresh cadence is governed by the server-side interval set in owner mode —
+# independent of this.
