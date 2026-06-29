@@ -1041,8 +1041,13 @@ def compute_metrics(df, spot, expiry=None, history=None):
     atm_row = w[w["strike"] == atm]
     if not atm_row.empty:
         atm_iv = float((safe_num(atm_row["call_iv"].iloc[0]) + safe_num(atm_row["put_iv"].iloc[0])) / 2)
+        # ATM vega per greek — stored to history for Vega Diff time-series chart
+        _atm_cv = safe_num(atm_row["call_vega"].iloc[0]) if "call_vega" in atm_row.columns else 0.0
+        _atm_pv = safe_num(atm_row["put_vega"].iloc[0])  if "put_vega"  in atm_row.columns else 0.0
     else:
-        atm_iv = 0.0
+        atm_iv  = 0.0
+        _atm_cv = 0.0
+        _atm_pv = 0.0
 
     # IV backfill if Dhan returns zero IVs
     try:
@@ -1141,7 +1146,9 @@ def compute_metrics(df, spot, expiry=None, history=None):
         "momentum": round(momentum, 0),
         "vega_skew": round(vega_skew, 3),
         "pcr": round(pcr, 2),
-        "atm_iv": round(atm_iv, 2),
+        "atm_iv":         round(atm_iv, 2),
+        "atm_call_vega":  round(_atm_cv, 6),
+        "atm_put_vega":   round(_atm_pv, 6),
         "atm": float(atm),
         "support": support,
         "resistance": resistance,
@@ -3590,9 +3597,11 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
 # ─── History helpers ──────────────────────────────────────────────────────────
 def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_excess=None, basis_gap=None, traded_basis=None):
     return {
-        "ts":           now_ist().strftime("%Y-%m-%dT%H:%M:%S"),
-        "spot":         spot,
-        "atm_iv":       m.get("atm_iv", 0),
+        "ts":              now_ist().strftime("%Y-%m-%dT%H:%M:%S"),
+        "spot":            spot,
+        "atm_iv":          m.get("atm_iv", 0),
+        "atm_call_vega":   m.get("atm_call_vega", None),
+        "atm_put_vega":    m.get("atm_put_vega",  None),
         "net_delta":    m.get("net_delta", 0),
         "oi_net_delta": m.get("momentum", 0),
         "momentum":     m.get("momentum", 0),
@@ -5992,6 +6001,109 @@ if _gd_src is not None:
             font=dict(color="#1A1A2E", size=11),
         )
         st.plotly_chart(_gv_fig, use_container_width=True, config={"displayModeBar": False})
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ATM VEGA DIFF vs SPOT — dual-axis time-series (full-width, live-refreshed)
+    # X-axis : time ticks (today_history)
+    # Left Y : Nifty Spot (amber line)
+    # Right Y: ATM Call Vega − ATM Put Vega (purple line, auto-scaled)
+    # +ve diff = call vega > put vega = IV buyers skewed to upside
+    # −ve diff = put vega > call vega = IV buyers skewed to downside / hedge demand
+    # Zero-cross = vega parity = transitional / neutral IV regime at ATM
+    # ─────────────────────────────────────────────────────────────────────────
+    _vd_times, _vd_spot, _vd_vdiff, _vd_atm_k = [], [], [], []
+    for _h in today_history:
+        _cv = _h.get("atm_call_vega")
+        _pv = _h.get("atm_put_vega")
+        if _cv is not None and _pv is not None and _h.get("spot"):
+            _vd_times.append(_h["ts"][11:19])        # HH:MM:SS from ISO timestamp
+            _vd_spot.append(float(_h["spot"]))
+            _vd_vdiff.append(round(float(_cv) - float(_pv), 6))
+            _vd_atm_k.append(int(_h.get("atm", 0)))
+
+    if len(_vd_times) >= 2:
+        _vd_fig = go.Figure()
+        # Left axis — Nifty Spot
+        _vd_fig.add_trace(go.Scatter(
+            x=_vd_times, y=_vd_spot,
+            name="Nifty Spot",
+            mode="lines",
+            line=dict(color="#F59E0B", width=2.5),
+            yaxis="y1",
+            hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+        ))
+        # Right axis — ATM Call Vega − Put Vega
+        _vd_fig.add_trace(go.Scatter(
+            x=_vd_times, y=_vd_vdiff,
+            name="ATM Call Vega − Put Vega",
+            mode="lines+markers",
+            line=dict(color="#7C3AED", width=2.0),
+            marker=dict(size=4, color="#7C3AED"),
+            yaxis="y2",
+            hovertemplate="%{x}<br>Vega Diff: <b>%{y:.5f}</b><extra>Vega Diff</extra>",
+        ))
+        # Zero line on right axis (vega parity)
+        _vd_fig.add_hline(
+            y=0, yref="y2",
+            line_dash="dot", line_color="#C4B5FD", line_width=1.5,
+            annotation_text="Vega Parity",
+            annotation_font=dict(size=9, color="#7C3AED"),
+            annotation_position="right",
+        )
+        # Mark ATM strike changes as vertical lines
+        _prev_atm = None
+        for _ti, _ak in zip(_vd_times, _vd_atm_k):
+            if _ak and _ak != _prev_atm and _prev_atm is not None:
+                _vd_fig.add_vline(
+                    x=_ti, line_dash="dash", line_color="#6B7280",
+                    line_width=1, opacity=0.5,
+                    annotation_text=f"ATM→{_ak:,}",
+                    annotation_font=dict(size=8, color="#6B7280"),
+                    annotation_position="top left",
+                )
+            _prev_atm = _ak
+        _vd_fig.update_layout(
+            title=dict(
+                text="ATM Vega Diff (Call − Put) vs Nifty Spot  "
+                     "<span style='font-size:11px;color:#6B7280'>"
+                     "Amber=Spot (left) · Purple=ATM Vega Diff (right) · "
+                     "+ve=Upside IV demand · −ve=Downside IV demand · "
+                     "Grey dash=ATM strike change</span>",
+                font=dict(size=13),
+            ),
+            height=250,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=65, r=65, t=50, b=30),
+            legend=dict(orientation="h", y=1.20, font=dict(size=10)),
+            yaxis=dict(
+                title="Nifty Spot",
+                titlefont=dict(color="#F59E0B"),
+                tickfont=dict(color="#F59E0B", size=9),
+                gridcolor="#F3F4F6",
+                autorange=True,
+                showgrid=True,
+            ),
+            yaxis2=dict(
+                title="ATM Vega Diff  (Call − Put)",
+                titlefont=dict(color="#7C3AED"),
+                tickfont=dict(color="#7C3AED", size=9),
+                overlaying="y", side="right",
+                zeroline=True, zerolinecolor="#C4B5FD", zerolinewidth=1.2,
+                autorange=True,
+                showgrid=False,
+            ),
+            xaxis=dict(
+                tickfont=dict(size=9),
+                title="Time (IST)",
+                showgrid=True, gridcolor="#F3F4F6",
+            ),
+            hovermode="x unified",
+            font=dict(color="#1A1A2E", size=11),
+        )
+        st.plotly_chart(_vd_fig, use_container_width=True,
+                        config={"displayModeBar": False})
+    else:
+        st.info("⏳ ATM Vega Diff chart — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
 
     # ═════════════════════════════════════════════════════════════════════════
     # LIVE GEX + VEGA INTERPRETATION ENGINE  (v2 — full matrix coverage)
