@@ -5993,6 +5993,186 @@ if _gd_src is not None:
         )
         st.plotly_chart(_gv_fig, use_container_width=True, config={"displayModeBar": False})
 
+    # ═════════════════════════════════════════════════════════════════════════
+    # LIVE GEX + VEGA INTERPRETATION ENGINE
+    # Combines net_gex and net_vega per-strike data with spot position to
+    # generate a plain-English regime summary + actionable trade guidance.
+    # Refreshes with every data tick — no extra API calls needed.
+    # ═════════════════════════════════════════════════════════════════════════
+    try:
+        _atm_mask   = (_gd_src["strike"] - spot).abs() <= 3 * NIFTY_STEP
+        _above_mask = _gd_src["strike"] > spot
+        _below_mask = _gd_src["strike"] < spot
+
+        # ── Key GEX levels ────────────────────────────────────────────────────
+        _net_gex_total  = float(_gd_src["net_gex"].sum())
+        _call_wall_k    = int(_gd_src.loc[_above_mask, "call_gex"].idxmax()
+                              if _above_mask.any() and "call_gex" in _gd_src.columns
+                              else _gd_src["call_gex"].idxmax())
+        _call_wall_k    = int(_gd_src.loc[_call_wall_k, "strike"]) if _above_mask.any() else 0
+        _put_wall_k     = int(_gd_src.loc[_below_mask, "put_gex"].idxmax()
+                              if _below_mask.any() and "put_gex" in _gd_src.columns
+                              else _gd_src["put_gex"].idxmax())
+        _put_wall_k     = int(_gd_src.loc[_put_wall_k, "strike"]) if _below_mask.any() else 0
+        _gamma_flip_now = m.get("gamma_flip")
+        _dist_to_call   = _call_wall_k - spot if _call_wall_k else 0
+        _dist_to_put    = spot - _put_wall_k  if _put_wall_k  else 0
+        _range_width    = _dist_to_call + _dist_to_put
+
+        # ── Key Vega levels ───────────────────────────────────────────────────
+        _net_vega_atm   = float(_gd_src.loc[_atm_mask, "net_vega"].sum())
+        _max_neg_vega_k = int(_gd_src.loc[_below_mask | _atm_mask, "net_vega"].idxmin()
+                              if (_below_mask | _atm_mask).any() else _gd_src["net_vega"].idxmin())
+        _max_neg_vega_k = int(_gd_src.loc[_max_neg_vega_k, "strike"])
+        _max_pos_vega_k = int(_gd_src.loc[_above_mask | _atm_mask, "net_vega"].idxmax()
+                              if (_above_mask | _atm_mask).any() else _gd_src["net_vega"].idxmax())
+        _max_pos_vega_k = int(_gd_src.loc[_max_pos_vega_k, "strike"])
+        _net_vega_total = float(_gd_src["net_vega"].sum())
+
+        # ── GEX regime ────────────────────────────────────────────────────────
+        _is_pos_gex     = _net_gex_total > 0
+        _above_flip     = (_gamma_flip_now is not None and spot > _gamma_flip_now)
+        _near_flip      = (_gamma_flip_now is not None and abs(spot - _gamma_flip_now) <= 2 * NIFTY_STEP)
+        _flip_str       = f"{int(_gamma_flip_now):,}" if _gamma_flip_now else "N/A"
+
+        # ── Vega regime ───────────────────────────────────────────────────────
+        _iv_suppressed  = _net_vega_atm < 0          # IV sellers dominating near spot
+        _iv_expanding   = _net_vega_atm > 0           # IV buyers dominating near spot
+        _vega_gravity   = abs(_net_vega_atm) > 0.3 * abs(_net_vega_total) if _net_vega_total != 0 else False
+
+        # ── Classify combined regime ──────────────────────────────────────────
+        if _is_pos_gex and _above_flip and _iv_suppressed:
+            _regime_tag   = "🟢 RANGE-BOUND  ·  IV SUPPRESSED"
+            _regime_color = "#059669"
+            _regime_bg    = "#ECFDF5"
+            _regime_text  = (
+                f"Spot ({spot:,.0f}) is above the Gamma Flip ({_flip_str}) and dealers are net long gamma. "
+                f"The dominant Call Wall at <b>{_call_wall_k:,}</b> ({_dist_to_call:.0f} pts away) is acting as a ceiling — "
+                f"dealers will sell into any rally toward it. "
+                f"IV sellers are controlling the ATM zone (negative Net Vega near spot), keeping premiums compressed. "
+                f"This is a <b>classic pinning session</b>."
+            )
+            _action_lines = [
+                f"✅ <b>Sell OTM strangles / short straddle</b> — IV is being suppressed, theta decay is your friend",
+                f"✅ <b>Range to trade: {_put_wall_k:,} – {_call_wall_k:,}</b> ({_range_width:.0f} pts wide) — fade moves to extremes",
+                f"⚠️ <b>Stop-loss</b> if spot closes above {_call_wall_k:,} — that breaks the pinning regime",
+                f"⚠️ <b>Stop-loss</b> if spot closes below Gamma Flip ({_flip_str}) — regime flips to trending/amplifying",
+            ]
+        elif _is_pos_gex and _above_flip and _iv_expanding:
+            _regime_tag   = "🟡 RANGE-BOUND  ·  IV BUILDING"
+            _regime_color = "#D97706"
+            _regime_bg    = "#FFFBEB"
+            _regime_text  = (
+                f"Spot ({spot:,.0f}) is above the Gamma Flip ({_flip_str}) — dealers are still long gamma (pinning). "
+                f"However, IV buyers are now active near ATM (positive Net Vega), suggesting the market is <b>pricing in a potential move</b>. "
+                f"The Call Wall at <b>{_call_wall_k:,}</b> remains the key resistance. "
+                f"This is a <b>transitional state</b> — pinning may break if IV keeps building."
+            )
+            _action_lines = [
+                f"⚠️ <b>Avoid naked short premium</b> — IV is rising, vega losses could offset theta gains",
+                f"✅ <b>Consider debit spreads</b> toward {_call_wall_k:,} if IV momentum continues",
+                f"✅ <b>Watch {_call_wall_k:,}</b> — a break with volume = regime shift to short-gamma trending",
+                f"📌 <b>Range still valid</b>: {_put_wall_k:,} – {_call_wall_k:,}, but narrowing risk is elevated",
+            ]
+        elif not _is_pos_gex and _iv_expanding:
+            _regime_tag   = "🔴 TRENDING  ·  IV EXPANDING"
+            _regime_color = "#DC2626"
+            _regime_bg    = "#FEF2F2"
+            _regime_text  = (
+                f"Spot ({spot:,.0f}) is in a <b>short-gamma regime</b> (Net GEX negative"
+                + (f", below Gamma Flip at {_flip_str}" if _gamma_flip_now else "")
+                + f"). Dealers are net short gamma — they must <b>buy into rallies and sell into drops</b>, amplifying moves. "
+                f"IV buyers control the ATM zone (positive Net Vega), confirming the market expects larger swings. "
+                f"This is a <b>directional / breakout session</b>."
+            )
+            _action_lines = [
+                f"🚨 <b>Do NOT sell naked options</b> — short gamma + expanding IV = unlimited risk",
+                f"✅ <b>Buy directional debit spreads</b> in the direction of the trend",
+                f"✅ <b>Long straddle / strangle</b> near ATM if no clear direction — vega gains likely",
+                f"📌 <b>IV gravity well at {_max_neg_vega_k:,}</b> — if spot reaches there, expect IV to compress temporarily",
+            ]
+        elif not _is_pos_gex and _iv_suppressed:
+            _regime_tag   = "🟠 TRENDING  ·  IV SUPPRESSED (CAUTION)"
+            _regime_color = "#EA580C"
+            _regime_bg    = "#FFF7ED"
+            _regime_text  = (
+                f"Spot ({spot:,.0f}) is in a <b>short-gamma regime</b> (Net GEX negative) but IV sellers are still active near ATM. "
+                f"This is an <b>unstable combination</b> — the directional move is underway but IV hasn't caught up yet. "
+                f"A sudden IV spike is possible, especially if spot approaches the IV kindling zone at <b>{_max_pos_vega_k:,}</b>."
+            )
+            _action_lines = [
+                f"⚠️ <b>Caution with short premium</b> — short-gamma means moves get amplified quickly",
+                f"✅ <b>Tight stop losses</b> on any short options position",
+                f"📌 <b>Watch {_max_pos_vega_k:,}</b> — if spot reaches this IV kindling zone, expect vol spike",
+                f"✅ <b>Debit spreads</b> are safer than naked options in this regime",
+            ]
+        elif _near_flip:
+            _regime_tag   = "⚡ FLIP ZONE  ·  REGIME UNSTABLE"
+            _regime_color = "#7C3AED"
+            _regime_bg    = "#F5F3FF"
+            _regime_text  = (
+                f"Spot ({spot:,.0f}) is <b>within {abs(spot - _gamma_flip_now):.0f} pts of the Gamma Flip ({_flip_str})</b>. "
+                f"This is the most dangerous zone — a small move can flip dealers from long gamma (pinning) to short gamma (amplifying). "
+                f"IV sensitivity is highest here. "
+                f"{'IV buyers are active — breakout likely if flip is crossed.' if _iv_expanding else 'IV sellers still present — flip may not trigger yet.'}"
+            )
+            _action_lines = [
+                f"🚨 <b>Reduce position size</b> — regime is about to change, direction unknown",
+                f"⚠️ <b>No new short premium</b> until spot resolves above or below {_flip_str}",
+                f"✅ <b>Watch the flip level {_flip_str}</b> — close above = bullish pinning resumes, close below = trending amplifying begins",
+                f"✅ <b>Long options / straddles</b> are favorable here — gamma is cheap at the flip",
+            ]
+        else:
+            _regime_tag   = "⬜ NEUTRAL  ·  REGIME UNCLEAR"
+            _regime_color = "#6B7280"
+            _regime_bg    = "#F9FAFB"
+            _regime_text  = (
+                f"GEX and Vega signals are mixed near spot ({spot:,.0f}). "
+                f"Insufficient signal strength for a high-confidence regime call. Collect more ticks."
+            )
+            _action_lines = [
+                "📌 Wait for clearer GEX/Vega alignment before entering directional or premium trades",
+            ]
+
+        # ── Key levels summary ─────────────────────────────────────────────────
+        _levels_html = (
+            f"<span style='color:#DC2626;font-weight:700'>Call Wall: {_call_wall_k:,}</span>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+            f"<span style='color:#059669;font-weight:700'>Put Wall: {_put_wall_k:,}</span>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+            f"<span style='color:#7C3AED;font-weight:700'>Gamma Flip: {_flip_str}</span>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+            f"<span style='color:#F97316;font-weight:700'>IV Gravity: {_max_neg_vega_k:,}</span>"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+            f"<span style='color:#2563EB;font-weight:700'>IV Kindling: {_max_pos_vega_k:,}</span>"
+        )
+
+        _actions_html = "".join(
+            f"<div style='margin:4px 0;font-size:13px;color:#1A1A2E'>{a}</div>" for a in _action_lines
+        )
+
+        st.markdown(
+            f"""<div style='background:{_regime_bg};border:2px solid {_regime_color};
+                border-radius:12px;padding:16px 20px;margin:14px 0'>
+              <div style='font-size:11px;font-weight:700;color:#6B7280;
+                text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px'>
+                ⚡ GEX + Vega Live Interpretation</div>
+              <div style='font-size:15px;font-weight:800;color:{_regime_color};
+                margin-bottom:10px'>{_regime_tag}</div>
+              <div style='font-size:13px;color:#374151;line-height:1.7;
+                margin-bottom:12px'>{_regime_text}</div>
+              <div style='background:rgba(0,0,0,0.04);border-radius:8px;
+                padding:10px 14px;margin-bottom:12px;font-size:11px;
+                color:#6B7280;line-height:2.0'>{_levels_html}</div>
+              <div style='font-size:11px;font-weight:700;color:#6B7280;
+                text-transform:uppercase;margin-bottom:6px'>Actionable Guidance</div>
+              {_actions_html}
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    except Exception as _interp_err:
+        st.caption(f"GEX+Vega interpretation unavailable: {_interp_err}")
+
     # ─────────────────────────────────────────────────────────────────────────
     # CHART 2 + ALERT CARD — Sub-D: Gamma Blast Proximity Detector
     # Identifies the nearest high-gamma OI concentration above and below spot.
