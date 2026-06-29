@@ -5859,61 +5859,139 @@ if _gd_src is not None:
     # Purple line = Net GEX: +ve = long-gamma/pinning regime, -ve = short-gamma/trending
     # Gamma Flip level = zero-crossing of cumulative Net GEX (computed in compute_true_gex).
     # ─────────────────────────────────────────────────────────────────────────
-    _gc1_fig = go.Figure()
+    # ── Net Vega per Strike ───────────────────────────────────────────────────
+    # Net Vega = (Call OI × Call Vega) - (Put OI × Put Vega)
+    # +ve = net long vega at that strike (buyers dominate → IV expansion expected)
+    # -ve = net short vega (sellers dominate → IV suppressed / gravity well)
+    for _vc in ["call_vega", "put_vega"]:
+        if _vc in _gd_src.columns:
+            _gd_src[_vc] = pd.to_numeric(_gd_src[_vc], errors="coerce").fillna(0.0)
+    _gd_src["call_vega_exp"] = _gd_src["call_oi"] * _gd_src["call_vega"]   # call vega exposure
+    _gd_src["put_vega_exp"]  = _gd_src["put_oi"]  * _gd_src["put_vega"]    # put vega exposure
+    _gd_src["net_vega"]      = _gd_src["call_vega_exp"] - _gd_src["put_vega_exp"]  # +ve = net long vega
 
-    _gc1_fig.add_trace(go.Bar(
-        x=_gd_src["strike"],
-        y=_gd_src["call_gex"],
-        name="Call GEX (Dealer Buy — Pinning)",
-        marker_color="#EF4444",
-        opacity=0.75,
-        hovertemplate="Strike %{x:,.0f}<br>Call GEX: %{y:,.2f}<extra>Dealer Buy / Pinning</extra>",
-    ))
-    _gc1_fig.add_trace(go.Bar(
-        x=_gd_src["strike"],
-        y=-_gd_src["put_gex"],
-        name="Put GEX (Dealer Sell — Amplifying)",
-        marker_color="#22C55E",
-        opacity=0.75,
-        hovertemplate="Strike %{x:,.0f}<br>Put GEX: %{y:,.2f}<extra>Dealer Sell / Amplifying</extra>",
-    ))
-    _gc1_fig.add_trace(go.Scatter(
-        x=_gd_src["strike"],
-        y=_gd_src["net_gex"],
-        name="Net Gamma Balance",
-        mode="lines+markers",
-        line=dict(color="#7C3AED", width=2.2),
-        marker=dict(size=5, color="#7C3AED"),
-        hovertemplate="Strike %{x:,.0f}<br>Net GEX: %{y:,.2f}<extra>Net GEX</extra>",
-    ))
-    _gc1_fig.add_vline(
-        x=spot, line_dash="dash", line_color="#F59E0B", line_width=2,
-        annotation_text=f"Spot {spot:,.0f}",
-        annotation_font=dict(size=10, color="#F59E0B"),
-        annotation_position="top right",
-    )
-    _gc1_fig.update_layout(
-        title=dict(
-            text="Option C — Standard GEX per Strike  "
-                 "<span style='font-size:11px;color:#6B7280'>"
-                 "Red=Call GEX (Pinning) · Green=Put GEX (Amplifying) · Purple=Net GEX</span>",
-            font=dict(size=13),
-        ),
-        barmode="overlay",
-        height=295,
-        paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-        margin=dict(l=55, r=20, t=50, b=30),
-        legend=dict(orientation="h", y=1.18, font=dict(size=10)),
-        yaxis=dict(
-            title="GEX  (OI × Γ × Spot² × 0.01)",
-            gridcolor="#F3F4F6",
-            zeroline=True, zerolinecolor="#9CA3AF", zerolinewidth=1.2,
-            tickfont=dict(size=9),
-        ),
-        xaxis=dict(title="Strike", tickfont=dict(size=9)),
-        font=dict(color="#1A1A2E", size=11),
-    )
-    st.plotly_chart(_gc1_fig, width='stretch', config={"displayModeBar": False})  # H23 fix: was use_container_width=True
+    # ── 2-column layout: GEX chart | Net Vega chart ──────────────────────────
+    _gc_col1, _gc_col2 = st.columns(2)
+
+    with _gc_col1:
+        _gc1_fig = go.Figure()
+        _gc1_fig.add_trace(go.Bar(
+            x=_gd_src["strike"],
+            y=_gd_src["call_gex"],
+            name="Call GEX (Dealer Buy — Pinning)",
+            marker_color="#EF4444",
+            opacity=0.75,
+            hovertemplate="Strike %{x:,.0f}<br>Call GEX: %{y:,.2f}<extra>Dealer Buy / Pinning</extra>",
+        ))
+        _gc1_fig.add_trace(go.Bar(
+            x=_gd_src["strike"],
+            y=-_gd_src["put_gex"],
+            name="Put GEX (Dealer Sell — Amplifying)",
+            marker_color="#22C55E",
+            opacity=0.75,
+            hovertemplate="Strike %{x:,.0f}<br>Put GEX: %{y:,.2f}<extra>Dealer Sell / Amplifying</extra>",
+        ))
+        _gc1_fig.add_trace(go.Scatter(
+            x=_gd_src["strike"],
+            y=_gd_src["net_gex"],
+            name="Net GEX",
+            mode="lines+markers",
+            line=dict(color="#7C3AED", width=2.2),
+            marker=dict(size=5, color="#7C3AED"),
+            hovertemplate="Strike %{x:,.0f}<br>Net GEX: %{y:,.2f}<extra>Net GEX</extra>",
+        ))
+        _gc1_fig.add_vline(
+            x=spot, line_dash="dash", line_color="#F59E0B", line_width=2,
+            annotation_text=f"Spot {spot:,.0f}",
+            annotation_font=dict(size=10, color="#F59E0B"),
+            annotation_position="top right",
+        )
+        _gc1_fig.update_layout(
+            title=dict(
+                text="Option C — Standard GEX per Strike  "
+                     "<span style='font-size:11px;color:#6B7280'>"
+                     "Red=Call GEX (Pinning) · Green=Put GEX (Amplifying) · Purple=Net GEX</span>",
+                font=dict(size=13),
+            ),
+            barmode="overlay",
+            height=310,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=55, r=20, t=50, b=30),
+            legend=dict(orientation="h", y=1.18, font=dict(size=10)),
+            yaxis=dict(
+                title="GEX  (OI × Γ × Spot² × 0.01)",
+                gridcolor="#F3F4F6",
+                zeroline=True, zerolinecolor="#9CA3AF", zerolinewidth=1.2,
+                tickfont=dict(size=9),
+            ),
+            xaxis=dict(title="Strike", tickfont=dict(size=9)),
+            font=dict(color="#1A1A2E", size=11),
+        )
+        st.plotly_chart(_gc1_fig, use_container_width=True, config={"displayModeBar": False})
+
+    with _gc_col2:
+        # ─────────────────────────────────────────────────────────────────────
+        # Net Vega per Strike chart
+        # Call bars = Call OI × Call Vega (long vega side — IV buyers)
+        # Put bars  = Put OI × Put Vega shown negative (short vega side — IV sellers)
+        # Orange line = Net Vega: +ve = IV expansion pressure, -ve = IV suppression
+        # Gravity wells (large -ve net vega strikes) = IV ceiling zones
+        # IV expansion strikes (large +ve net vega) = breakout IV kindling
+        # ─────────────────────────────────────────────────────────────────────
+        _gv_fig = go.Figure()
+        _gv_fig.add_trace(go.Bar(
+            x=_gd_src["strike"],
+            y=_gd_src["call_vega_exp"],
+            name="Call Vega Exp (Long IV)",
+            marker_color="#2563EB",
+            opacity=0.70,
+            hovertemplate="Strike %{x:,.0f}<br>Call Vega Exp: %{y:,.2f}<extra>Long IV Pressure</extra>",
+        ))
+        _gv_fig.add_trace(go.Bar(
+            x=_gd_src["strike"],
+            y=-_gd_src["put_vega_exp"],
+            name="Put Vega Exp (Short IV)",
+            marker_color="#D97706",
+            opacity=0.70,
+            hovertemplate="Strike %{x:,.0f}<br>Put Vega Exp: %{y:,.2f}<extra>Short IV Pressure</extra>",
+        ))
+        _gv_fig.add_trace(go.Scatter(
+            x=_gd_src["strike"],
+            y=_gd_src["net_vega"],
+            name="Net Vega",
+            mode="lines+markers",
+            line=dict(color="#F97316", width=2.2),
+            marker=dict(size=5, color="#F97316"),
+            hovertemplate="Strike %{x:,.0f}<br>Net Vega: %{y:,.2f}<extra>Net Vega</extra>",
+        ))
+        _gv_fig.add_vline(
+            x=spot, line_dash="dash", line_color="#F59E0B", line_width=2,
+            annotation_text=f"Spot {spot:,.0f}",
+            annotation_font=dict(size=10, color="#F59E0B"),
+            annotation_position="top right",
+        )
+        _gv_fig.update_layout(
+            title=dict(
+                text="Net Vega per Strike  "
+                     "<span style='font-size:11px;color:#6B7280'>"
+                     "Blue=Call Vega Exp · Amber=Put Vega Exp · Orange=Net Vega</span>",
+                font=dict(size=13),
+            ),
+            barmode="overlay",
+            height=310,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=55, r=20, t=50, b=30),
+            legend=dict(orientation="h", y=1.18, font=dict(size=10)),
+            yaxis=dict(
+                title="Vega Exposure  (OI × Vega)",
+                gridcolor="#F3F4F6",
+                zeroline=True, zerolinecolor="#9CA3AF", zerolinewidth=1.2,
+                tickfont=dict(size=9),
+            ),
+            xaxis=dict(title="Strike", tickfont=dict(size=9)),
+            font=dict(color="#1A1A2E", size=11),
+        )
+        st.plotly_chart(_gv_fig, use_container_width=True, config={"displayModeBar": False})
 
     # ─────────────────────────────────────────────────────────────────────────
     # CHART 2 + ALERT CARD — Sub-D: Gamma Blast Proximity Detector
