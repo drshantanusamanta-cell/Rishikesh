@@ -807,13 +807,17 @@ def fetch_dhan_option_chain(expiry=None):
         _r = RISK_FREE_RATE
         for i, row in df.iterrows():
             _K = row["strike"]
-            if row["call_delta"] == 0 and row["call_iv"] > 0.5 and spot > 0 and _T > 0:
+            # Fix: also backfill when gamma==0 even if delta is non-zero.
+            # Dhan sometimes returns a small non-zero delta but omits gamma for OTM
+            # strikes — previously those rows stayed at gamma=0, zeroing out their
+            # GEX contribution. Condition: IV > 0.5 ensures we have a usable input.
+            if (row["call_delta"] == 0 or row["call_gamma"] == 0) and row["call_iv"] > 0.5 and spot > 0 and _T > 0:
                 _d, _g, _th, _ve = _bs_greeks(spot, _K, _T, _r, row["call_iv"] / 100.0, "CE")
                 df.at[i, "call_delta"] = _d
                 df.at[i, "call_gamma"] = _g
                 df.at[i, "call_theta"] = _th
                 df.at[i, "call_vega"]  = _ve
-            if row["put_delta"] == 0 and row["put_iv"] > 0.5 and spot > 0 and _T > 0:
+            if (row["put_delta"] == 0 or row["put_gamma"] == 0) and row["put_iv"] > 0.5 and spot > 0 and _T > 0:
                 _d, _g, _th, _ve = _bs_greeks(spot, _K, _T, _r, row["put_iv"] / 100.0, "PE")
                 df.at[i, "put_delta"] = _d
                 df.at[i, "put_gamma"] = _g
@@ -3736,6 +3740,17 @@ def _raw_fetch_and_compute(expiry_override=None, history=None):
     df_band  = m.pop("df_band", df)
     df_sig   = m.pop("df_signal", df)
 
+    # Bug 2 prep: store the front-expiry GEX series so the display section can
+    # combine it with the back-expiry chain without an extra API call.
+    # compute_true_gex already runs inside compute_metrics; calling it again here
+    # is cheap (pure NumPy, no I/O) and avoids coupling the payload schema to
+    # internal compute_metrics state.
+    try:
+        _, _front_gex_series, _ = compute_true_gex(df, spot)
+        m["_front_gex_by_strike"] = _front_gex_series.to_dict()   # {strike: net_gex}
+    except Exception:
+        m["_front_gex_by_strike"] = {}
+
     traded_fut   = fetch_futures_ltp(expiry)
     _atm         = safe_num(m.get("atm", 0))
     _df_band_lst = df_band.fillna(0).to_dict("records")
@@ -5208,6 +5223,32 @@ if len(_expiry_list) > 1 and USE_DHAN:
         _back_chain, _, _ = fetch_dhan_option_chain_cached(_back_exp)
         if not _back_chain.empty:
             _back_m = compute_metrics(_back_chain, spot, _back_exp)
+
+            # Bug 2 fix: override gamma_flip with a combined front+back expiry value.
+            # Front GEX series was stored in the payload during _raw_fetch_and_compute
+            # (no extra API call). Back chain is already fetched above.
+            try:
+                _front_gex_s = pd.Series(m.get("_front_gex_by_strike", {}),
+                                          dtype=float)
+                _, _back_gex_s, _ = compute_true_gex(_back_chain, spot)
+                if not _front_gex_s.empty and not _back_gex_s.empty:
+                    _combined_gex = (_front_gex_s
+                                     .add(_back_gex_s, fill_value=0)
+                                     .sort_index())
+                    _cv  = _combined_gex.cumsum().values
+                    _ci  = _combined_gex.index.values.astype(float)
+                    _sm  = _cv[:-1] * _cv[1:] < 0
+                    _cl  = _ci[:-1][_sm]
+                    if len(_cl) > 0:
+                        _nr  = _cl[np.argmin(np.abs(_cl - spot))]
+                        _ii  = int(np.searchsorted(_ci, _nr))
+                        _g0c = float(_cv[_ii]);  _g1c = float(_cv[_ii + 1])
+                        _s0c = float(_ci[_ii]);  _s1c = float(_ci[_ii + 1])
+                        _combined_flip = round(
+                            _s0c + (_s1c - _s0c) * (-_g0c) / (_g1c - _g0c), 0)
+                        m["gamma_flip"] = _combined_flip
+            except Exception:
+                pass   # fall back to front-only flip already in m
             if _back_m:
                 _front_pcr = m.get("pcr", 1.0)
                 _back_pcr = _back_m.get("pcr", 1.0)
@@ -5957,13 +5998,11 @@ if _gd_src is not None:
     _gd_src["put_gex"]  = _gd_src["put_oi"]  * _gd_src["put_gamma"]  * NIFTY_LOT_SIZE * _spot2 * 0.01
     _gd_src["net_gex"]  = _gd_src["call_gex"] - _gd_src["put_gex"]   # +ve = net long gamma (pinning), -ve = net short gamma (trending)
 
-    # Chart-level gamma flip: cumsum of unweighted net_gex → zero-crossing.
-    # This matches the bars shown on the chart (same formula), so the flip
-    # annotation will visually align with where the purple line crosses zero.
-    _chart_cumgex   = _gd_src.sort_values("strike")["net_gex"].cumsum().values
-    _chart_strikes  = _gd_src.sort_values("strike")["strike"].values
-    _chart_flip_cands = _chart_strikes[_chart_cumgex <= 0]
-    _chart_gamma_flip = float(_chart_flip_cands[-1]) if len(_chart_flip_cands) > 0 else None
+    # Chart-level gamma flip: reuse the already-corrected value from m.get("gamma_flip").
+    # Previously this block independently recomputed the flip from band-only data using
+    # the old flip_cands[-1] logic — both Bug 1 (band truncation) and Bug 3 (wrong
+    # crossing). Now it mirrors the metrics panel so chart annotation == displayed value.
+    _chart_gamma_flip = m.get("gamma_flip")
 
     _gd_atm_band = spot * 0.003
 
