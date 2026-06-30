@@ -435,8 +435,22 @@ def compute_true_gex(df, spot):
     total_gex  = float(net_arr.sum())
     gex_series = pd.Series(net_arr, index=strikes)
     cumulative = gex_series.sort_index().cumsum()
-    flip_cands = cumulative[cumulative <= 0].index
-    gamma_flip = float(flip_cands[-1]) if len(flip_cands) > 0 else None
+    # Bug 3 fix: find zero-crossing nearest to spot and interpolate.
+    # Old logic (`flip_cands[-1]`) took the highest strike with cumGEX ≤ 0,
+    # which picks the wrong crossing when the GEX profile oscillates.
+    _cum_vals  = cumulative.values
+    _cum_idx   = cumulative.index.values
+    _sign_mask = _cum_vals[:-1] * _cum_vals[1:] < 0         # True at each sign change
+    _cross_lows = _cum_idx[:-1][_sign_mask]                  # lower strike of each crossing
+    if len(_cross_lows) > 0:
+        # pick the crossing whose lower strike is closest to spot
+        _nearest   = _cross_lows[np.argmin(np.abs(_cross_lows - spot))]
+        _i         = int(np.searchsorted(_cum_idx, _nearest))
+        _g0, _g1   = float(_cum_vals[_i]), float(_cum_vals[_i + 1])
+        _s0, _s1   = float(_cum_idx[_i]),  float(_cum_idx[_i + 1])
+        gamma_flip = _s0 + (_s1 - _s0) * (-_g0) / (_g1 - _g0)  # linear interpolation
+    else:
+        gamma_flip = None
     return total_gex, gex_series, gamma_flip
 
 
@@ -1065,7 +1079,10 @@ def compute_metrics(df, spot, expiry=None, history=None):
     vega_skew  = sum_vega_c / sum_vega_p if sum_vega_p > 0 else 1.0
 
     w = wide_df.copy()
-    true_gex, _gex_series, gamma_flip = compute_true_gex(w, spot)
+    # Bug 1 fix: GEX and gamma flip must use the FULL chain, not the ±500-pt band.
+    # wide_df (ATM ± STRUCTURAL_BAND strikes) truncates deep OTM put OI which
+    # carries significant negative GEX and drags the flip point downward.
+    true_gex, _gex_series, gamma_flip = compute_true_gex(df, spot)
     gex = true_gex
     iv_rank, iv_pct = compute_iv_rank(w, atm)
     gt_ratio = abs(net_gamma) / max(abs(net_theta), 1e-6)
