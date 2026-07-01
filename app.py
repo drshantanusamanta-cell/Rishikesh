@@ -435,23 +435,58 @@ def compute_true_gex(df, spot):
     total_gex  = float(net_arr.sum())
     gex_series = pd.Series(net_arr, index=strikes)
     cumulative = gex_series.sort_index().cumsum()
-    # Bug 3 fix: find zero-crossing nearest to spot and interpolate.
-    # Old logic (`flip_cands[-1]`) took the highest strike with cumGEX ≤ 0,
-    # which picks the wrong crossing when the GEX profile oscillates.
-    _cum_vals  = cumulative.values
-    _cum_idx   = cumulative.index.values
-    _sign_mask = _cum_vals[:-1] * _cum_vals[1:] < 0         # True at each sign change
-    _cross_lows = _cum_idx[:-1][_sign_mask]                  # lower strike of each crossing
-    if len(_cross_lows) > 0:
-        # pick the crossing whose lower strike is closest to spot
-        _nearest   = _cross_lows[np.argmin(np.abs(_cross_lows - spot))]
-        _i         = int(np.searchsorted(_cum_idx, _nearest))
-        _g0, _g1   = float(_cum_vals[_i]), float(_cum_vals[_i + 1])
-        _s0, _s1   = float(_cum_idx[_i]),  float(_cum_idx[_i + 1])
-        gamma_flip = _s0 + (_s1 - _s0) * (-_g0) / (_g1 - _g0)  # linear interpolation
-    else:
-        gamma_flip = None
+    flip_cands = cumulative[cumulative <= 0].index
+    gamma_flip = float(flip_cands[-1]) if len(flip_cands) > 0 else None
     return total_gex, gex_series, gamma_flip
+
+
+def compute_gamma_flip_true(df, spot, T, r=RISK_FREE_RATE, band_pct=0.20, n_pts=60):
+    """Zero-gamma / flip level — price-domain method (Perfiliev / SpotGamma).
+
+    The flip returned by compute_true_gex() above is a STRIKE-domain cumulative-
+    GEX crossing computed at today's spot; it is not the same quantity as the
+    "gamma flip" / "zero gamma" reported by SpotGamma and most vendors. That
+    flip is a PRICE-domain quantity: recompute every option's gamma via
+    Black-Scholes at a grid of hypothetical spot levels (today's IV smile held
+    fixed per strike), sum GEX at each level, and find where the total changes
+    sign. Parameters (±20% band, 60 points, first sign crossing scanning up
+    from the bottom of the range) match the reference implementation cited in
+    compute_true_gex's own docstring.
+
+    Returns None if no sign crossing is found within the scanned band (caller
+    should fall back to the strike-domain flip in that case).
+    """
+    if df is None or df.empty or spot <= 0 or T <= 0:
+        return None
+    lo = max(spot * (1 - band_pct), float(df["strike"].min()))
+    hi = min(spot * (1 + band_pct), float(df["strike"].max()))
+    if hi <= lo:
+        return None
+    levels = np.linspace(lo, hi, n_pts)
+
+    strikes = df["strike"].values
+    iv_c = df["call_iv"].values / 100.0
+    iv_p = df["put_iv"].values / 100.0
+    call_oi = df["call_oi"].values
+    put_oi = df["put_oi"].values
+
+    total_gamma = np.empty(n_pts)
+    for i, S in enumerate(levels):
+        cg = np.array([_bs_greeks(S, K, T, r, s, "CE")[1] for K, s in zip(strikes, iv_c)])
+        pg = np.array([_bs_greeks(S, K, T, r, s, "PE")[1] for K, s in zip(strikes, iv_p)])
+        call_gex = (call_oi * cg * NIFTY_LOT_SIZE * (S ** 2) * 0.01).sum()
+        put_gex  = (put_oi  * pg * NIFTY_LOT_SIZE * (S ** 2) * 0.01).sum()
+        total_gamma[i] = call_gex - put_gex
+
+    cross = np.where(np.diff(np.sign(total_gamma)))[0]
+    if len(cross) == 0:
+        return None
+    i = cross[0]
+    x0, y0 = levels[i], total_gamma[i]
+    x1, y1 = levels[i + 1], total_gamma[i + 1]
+    if y1 == y0:
+        return float(x0)
+    return float(x1 - (x1 - x0) * y1 / (y1 - y0))
 
 
 def compute_iv_rank(df, atm):
@@ -807,17 +842,13 @@ def fetch_dhan_option_chain(expiry=None):
         _r = RISK_FREE_RATE
         for i, row in df.iterrows():
             _K = row["strike"]
-            # Fix: also backfill when gamma==0 even if delta is non-zero.
-            # Dhan sometimes returns a small non-zero delta but omits gamma for OTM
-            # strikes — previously those rows stayed at gamma=0, zeroing out their
-            # GEX contribution. Condition: IV > 0.5 ensures we have a usable input.
-            if (row["call_delta"] == 0 or row["call_gamma"] == 0) and row["call_iv"] > 0.5 and spot > 0 and _T > 0:
+            if row["call_delta"] == 0 and row["call_iv"] > 0.5 and spot > 0 and _T > 0:
                 _d, _g, _th, _ve = _bs_greeks(spot, _K, _T, _r, row["call_iv"] / 100.0, "CE")
                 df.at[i, "call_delta"] = _d
                 df.at[i, "call_gamma"] = _g
                 df.at[i, "call_theta"] = _th
                 df.at[i, "call_vega"]  = _ve
-            if (row["put_delta"] == 0 or row["put_gamma"] == 0) and row["put_iv"] > 0.5 and spot > 0 and _T > 0:
+            if row["put_delta"] == 0 and row["put_iv"] > 0.5 and spot > 0 and _T > 0:
                 _d, _g, _th, _ve = _bs_greeks(spot, _K, _T, _r, row["put_iv"] / 100.0, "PE")
                 df.at[i, "put_delta"] = _d
                 df.at[i, "put_gamma"] = _g
@@ -1083,11 +1114,25 @@ def compute_metrics(df, spot, expiry=None, history=None):
     vega_skew  = sum_vega_c / sum_vega_p if sum_vega_p > 0 else 1.0
 
     w = wide_df.copy()
-    # Bug 1 fix: GEX and gamma flip must use the FULL chain, not the ±500-pt band.
-    # wide_df (ATM ± STRUCTURAL_BAND strikes) truncates deep OTM put OI which
-    # carries significant negative GEX and drags the flip point downward.
-    true_gex, _gex_series, gamma_flip = compute_true_gex(df, spot)
+    true_gex, _gex_series, _gamma_flip_naive = compute_true_gex(w, spot)
     gex = true_gex
+
+    # Gamma flip: use the price-domain zero-gamma method (see
+    # compute_gamma_flip_true docstring) instead of the strike-domain
+    # cumulative-GEX crossing. Falls back to the naive flip if the scanned
+    # spot band contains no sign crossing (e.g. too few strikes returned).
+    _T_flip = 7 / 365
+    if expiry:
+        for _fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+            try:
+                _exp_dt = datetime.strptime(str(expiry), _fmt).date()
+                _T_flip = max(1 / 365, (_exp_dt - date.today()).days / 365)
+                break
+            except ValueError:
+                continue
+    gamma_flip = compute_gamma_flip_true(w, spot, _T_flip)
+    if gamma_flip is None:
+        gamma_flip = _gamma_flip_naive
     iv_rank, iv_pct = compute_iv_rank(w, atm)
     gt_ratio = abs(net_gamma) / max(abs(net_theta), 1e-6)
     total_coi = float(w["call_oi"].sum())
@@ -3740,17 +3785,6 @@ def _raw_fetch_and_compute(expiry_override=None, history=None):
     df_band  = m.pop("df_band", df)
     df_sig   = m.pop("df_signal", df)
 
-    # Bug 2 prep: store the front-expiry GEX series so the display section can
-    # combine it with the back-expiry chain without an extra API call.
-    # compute_true_gex already runs inside compute_metrics; calling it again here
-    # is cheap (pure NumPy, no I/O) and avoids coupling the payload schema to
-    # internal compute_metrics state.
-    try:
-        _, _front_gex_series, _ = compute_true_gex(df, spot)
-        m["_front_gex_by_strike"] = _front_gex_series.to_dict()   # {strike: net_gex}
-    except Exception:
-        m["_front_gex_by_strike"] = {}
-
     traded_fut   = fetch_futures_ltp(expiry)
     _atm         = safe_num(m.get("atm", 0))
     _df_band_lst = df_band.fillna(0).to_dict("records")
@@ -5223,32 +5257,6 @@ if len(_expiry_list) > 1 and USE_DHAN:
         _back_chain, _, _ = fetch_dhan_option_chain_cached(_back_exp)
         if not _back_chain.empty:
             _back_m = compute_metrics(_back_chain, spot, _back_exp)
-
-            # Bug 2 fix: override gamma_flip with a combined front+back expiry value.
-            # Front GEX series was stored in the payload during _raw_fetch_and_compute
-            # (no extra API call). Back chain is already fetched above.
-            try:
-                _front_gex_s = pd.Series(m.get("_front_gex_by_strike", {}),
-                                          dtype=float)
-                _, _back_gex_s, _ = compute_true_gex(_back_chain, spot)
-                if not _front_gex_s.empty and not _back_gex_s.empty:
-                    _combined_gex = (_front_gex_s
-                                     .add(_back_gex_s, fill_value=0)
-                                     .sort_index())
-                    _cv  = _combined_gex.cumsum().values
-                    _ci  = _combined_gex.index.values.astype(float)
-                    _sm  = _cv[:-1] * _cv[1:] < 0
-                    _cl  = _ci[:-1][_sm]
-                    if len(_cl) > 0:
-                        _nr  = _cl[np.argmin(np.abs(_cl - spot))]
-                        _ii  = int(np.searchsorted(_ci, _nr))
-                        _g0c = float(_cv[_ii]);  _g1c = float(_cv[_ii + 1])
-                        _s0c = float(_ci[_ii]);  _s1c = float(_ci[_ii + 1])
-                        _combined_flip = round(
-                            _s0c + (_s1c - _s0c) * (-_g0c) / (_g1c - _g0c), 0)
-                        m["gamma_flip"] = _combined_flip
-            except Exception:
-                pass   # fall back to front-only flip already in m
             if _back_m:
                 _front_pcr = m.get("pcr", 1.0)
                 _back_pcr = _back_m.get("pcr", 1.0)
@@ -5998,10 +6006,13 @@ if _gd_src is not None:
     _gd_src["put_gex"]  = _gd_src["put_oi"]  * _gd_src["put_gamma"]  * NIFTY_LOT_SIZE * _spot2 * 0.01
     _gd_src["net_gex"]  = _gd_src["call_gex"] - _gd_src["put_gex"]   # +ve = net long gamma (pinning), -ve = net short gamma (trending)
 
-    # Chart-level gamma flip: reuse the already-corrected value from m.get("gamma_flip").
-    # Previously this block independently recomputed the flip from band-only data using
-    # the old flip_cands[-1] logic — both Bug 1 (band truncation) and Bug 3 (wrong
-    # crossing). Now it mirrors the metrics panel so chart annotation == displayed value.
+    # Chart-level gamma flip: reconciled to use the same corrected, price-domain
+    # zero-gamma metric (m["gamma_flip"], from compute_gamma_flip_true) that the
+    # rest of the app (Combined Decision, bias engine, headline tiles) reads,
+    # instead of an independent strike-domain cumsum recompute off this chart's
+    # own bars. That local recompute is the same STRIKE-domain proxy flagged as
+    # non-standard in compute_true_gex's docstring, and could silently disagree
+    # with the corrected flip shown everywhere else in the app.
     _chart_gamma_flip = m.get("gamma_flip")
 
     _gd_atm_band = spot * 0.003
@@ -6012,7 +6023,8 @@ if _gd_src is not None:
     # Red bars   = Call GEX (dealers long gamma → buy dips/sell rallies → PINNING)
     # Green bars = Put GEX shown as negative (dealers short gamma → amplify moves → TRENDING)
     # Purple line = Net GEX: +ve = long-gamma/pinning regime, -ve = short-gamma/trending
-    # Gamma Flip level = zero-crossing of cumulative Net GEX (computed in compute_true_gex).
+    # Gamma Flip level = m["gamma_flip"], the price-domain zero-gamma level from
+    # compute_gamma_flip_true (not a zero-crossing of this chart's own bars).
     # ─────────────────────────────────────────────────────────────────────────
     # ── Net Vega per Strike ───────────────────────────────────────────────────
     # Net Vega = (Call OI × Call Vega) - (Put OI × Put Vega)
@@ -6061,8 +6073,8 @@ if _gd_src is not None:
             annotation_font=dict(size=10, color="#F59E0B"),
             annotation_position="top right",
         )
-        # Chart-level gamma flip — computed from the same unweighted bars shown here,
-        # so the annotation always aligns with where the purple Net GEX line crosses zero.
+        # Gamma flip annotation — reconciled to the app-wide corrected metric
+        # (m["gamma_flip"]); see comment where _chart_gamma_flip is set above.
         if _chart_gamma_flip is not None:
             _gc1_fig.add_vline(
                 x=_chart_gamma_flip, line_dash="dot", line_color="#10B981", line_width=1.8,
